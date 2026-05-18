@@ -183,11 +183,6 @@ namespace RPG.Managers
 
 #endif
 
-        /// <summary>
-        /// SHA256 de uma string UTF-8. Retorna hex lowercase sem hífens.
-        /// Usa SHA256.HashData (.NET 5+) — zero alocação de instância,
-        /// thread-safe nativamente, ~30% mais rápido que SHA256.Create.
-        /// </summary>
 public static string ComputeSHA256(string input)
 {
     if (string.IsNullOrEmpty(input))

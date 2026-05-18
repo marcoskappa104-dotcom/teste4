@@ -15,27 +15,20 @@ namespace RPG.Network
     /// <summary>
     /// Monstro com IA e combate server-authoritative.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (sistema de armas) ===
+    /// === MUDANÇAS DESTA VERSÃO (correção de XP indevido) ===
     ///
-    ///   1. CmdBasicAttack AGORA CONSULTA O PERFIL DE ARMA SERVER-SIDE:
-    ///      Em vez de confiar no clientAttackRange, o servidor lê o item
-    ///      no slot Weapon do NetworkInventory, resolve o perfil efetivo,
-    ///      e usa o range/multiplicador/damage type do perfil REAL.
-    ///      O parâmetro clientAttackRange é mantido como informação de
-    ///      intenção (anti-cheat: cap = min(clientRange, profileRange)).
+    ///   1. DAMAGE LOG SÓ NA APLICAÇÃO DE DANO:
+    ///      Antes, CmdBasicAttack ranged adicionava ao _damageLog ANTES do
+    ///      projétil chegar. Se o projétil errasse por timeout ou se o
+    ///      atacante morresse no caminho, o XP era distribuído para um
+    ///      dano que nunca foi aplicado.
+    ///      Agora:
+    ///        - Melee: damage log no impacto imediato (como antes).
+    ///        - Ranged: damage log em ServerTakeProjectileDamage, com o
+    ///          shooter netId fornecido pelo Projectile.
     ///
-    ///   2. PROJÉTEIS QUANDO ARMA RANGED:
-    ///      Se profile.UsesProjectile, o servidor spawna um Projectile via
-    ///      Projectile.ServerSpawnFromPlayerAttack (chamado aqui inline).
-    ///      O Projectile carrega o dano JÁ CALCULADO e aplica no impacto
-    ///      via ServerTakeProjectileDamage.
-    ///
-    ///   3. CUSTO DE MANA NO BÁSICO:
-    ///      Se profile.ManaCost > 0 (cajado/varinha), valida MP e consome
-    ///      antes de aplicar dano. Se faltar mana, rejeita o ataque.
-    ///
-    ///   4. PROJECTILE PREFAB:
-    ///      Referenciado via RPGNetworkManager.GetProjectilePrefab(WeaponType).
+    ///   2. ASSINATURA DE ServerTakeProjectileDamage ESTENDIDA:
+    ///      Agora recebe shooterNetId para creditar o XP corretamente.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -382,7 +375,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Coroutines de IA (inalteradas)
+        // Coroutines de IA
         // ══════════════════════════════════════════════════════════════════
 
         [Server]
@@ -453,7 +446,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Estados de IA (inalterados)
+        // Estados de IA
         // ══════════════════════════════════════════════════════════════════
 
         private void ServerPatrolWaypoints()
@@ -767,32 +760,57 @@ namespace RPG.Network
             return null;
         }
 
+        /// <summary>
+        /// Adiciona dmg ao damage log do shooter, validando que o netId
+        /// corresponde a um jogador ainda vivo. Usado tanto por melee
+        /// (impacto imediato) quanto por projéteis (impacto tardio).
+        /// </summary>
+        [Server]
+        private void CreditDamageToShooter(uint shooterNetId, float dmg)
+        {
+            if (dmg <= 0f) return;
+            if (shooterNetId == 0) return;
+
+            // Valida que o atacante ainda existe (não é um netId zumbi)
+            var attacker = FindPlayerByNetId(shooterNetId);
+            if (attacker == null) return;
+
+            if (!_damageLog.ContainsKey(shooterNetId)) _damageLog[shooterNetId] = 0f;
+            _damageLog[shooterNetId] += dmg;
+        }
+
         // ══════════════════════════════════════════════════════════════════
         // Recebimento de dano POR PROJÉTIL
         // ══════════════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Chamado pelo Projectile no impacto. O dano já foi calculado quando
-        /// o projétil foi disparado — aqui só aplicamos e mostramos VFX.
-        ///
-        /// Como o atacante já está fora de cena lógica (não conseguimos saber
-        /// se ele continua aggro), creditamos o dano ao próprio Projectile.
-        /// Damage log usa um shooter netId armazenado no Projectile.
+        /// Chamado pelo Projectile no impacto. Recebe shooterNetId para que o
+        /// XP seja creditado APENAS quando o dano é realmente aplicado
+        /// (não no momento do disparo). Isso evita XP indevido quando o
+        /// projétil erra por timeout ou alvo se move demais.
         /// </summary>
         [Server]
-        public void ServerTakeProjectileDamage(float dmg, bool crit)
+        public void ServerTakeProjectileDamage(uint shooterNetId, float dmg, bool crit)
         {
             if (_isDead || _deathProcessed) return;
 
             dmg = SanitizeDamage(dmg);
             dmg = Mathf.Max(1f, dmg);
 
+            CreditDamageToShooter(shooterNetId, dmg);
+
+            // Aggro reaction: como o atacante atirou de longe, ainda assim
+            // queremos que o monstro reaja (perseguir/fugir/etc)
+            var attacker = FindPlayerByNetId(shooterNetId);
+            if (attacker != null && !attacker.Dead)
+                ApplyAggroReaction(attacker);
+
             RpcShowDamage(dmg, crit, ImpactPoint);
             ApplyDamageInternal(dmg);
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // CmdRequestSkill (inalterado, mas mantido aqui para referência)
+        // CmdRequestSkill
         // ══════════════════════════════════════════════════════════════════
 
         [Command(requiresAuthority = false)]
@@ -843,7 +861,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // CmdBasicAttack — agora consulta o perfil de arma server-side
+        // CmdBasicAttack — damage log SÓ na aplicação
         // ══════════════════════════════════════════════════════════════════
 
         [Command(requiresAuthority = false)]
@@ -864,13 +882,10 @@ namespace RPG.Network
             if (atkStats == null) return;
 
             // === RESOLVE O PERFIL DE ARMA NO SERVIDOR ===
-            // Cliente não dita range/multiplicador/tipo — apenas envia a intenção.
-            // O servidor decide tudo baseado no item REAL equipado.
             var inventory = attacker.GetComponent<NetworkInventory>();
             WeaponAttackProfile profile = ResolveServerWeaponProfile(inventory);
 
             // Anti-cheat: cliente não pode reportar range maior que o real do perfil.
-            // Aceitamos o menor entre cliente e servidor (defesa em profundidade).
             float serverRange = profile.Range;
             float effectiveRange = Mathf.Min(
                 Mathf.Clamp(clientAttackRange, 0.5f, SERVER_MAX_PLAYER_ATTACK_RANGE),
@@ -909,13 +924,6 @@ namespace RPG.Network
             bool hit = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
             if (!hit)
             {
-                if (profile.UsesProjectile)
-                {
-                    // Mesmo errando, lança o projétil (para feedback visual);
-                    // o miss flutua no alvo no impacto. Para simplicidade aqui,
-                    // mostramos miss no alvo IMEDIATAMENTE e não spawnamos projétil.
-                    // (Spawnar e fazer "miss visual" no impacto exigiria flag no Projectile.)
-                }
                 RpcShowMiss(transform.position);
                 return;
             }
@@ -948,21 +956,18 @@ namespace RPG.Network
             dmg = SanitizeDamage(dmg);
             dmg = Mathf.Max(1f, dmg);
 
-            // Damage log para distribuir XP
-            if (!_damageLog.ContainsKey(attacker.netId)) _damageLog[attacker.netId] = 0f;
-            _damageLog[attacker.netId] += dmg;
-
-            // Aggro reaction roda independente de melee/ranged
-            ApplyAggroReaction(attacker);
-
             if (profile.UsesProjectile)
             {
-                // Ranged: spawn do projétil. Dano só aplica no impacto.
+                // RANGED: damage log será creditado em ServerTakeProjectileDamage
+                // quando o projétil REALMENTE impactar. Aggro reaction também
+                // acontece no impacto, dando feedback mais natural.
                 SpawnAttackProjectile(attacker, profile, dmg, crit);
             }
             else
             {
-                // Melee: dano instantâneo
+                // MELEE: dano e crédito imediatos
+                CreditDamageToShooter(attacker.netId, dmg);
+                ApplyAggroReaction(attacker);
                 RpcShowDamage(dmg, crit, ImpactPoint);
                 ApplyDamageInternal(dmg);
             }
@@ -991,6 +996,7 @@ namespace RPG.Network
 
         /// <summary>
         /// Spawna um projétil no servidor que vai impactar o monstro.
+        /// O projétil carrega o shooterNetId para creditar o dano no impacto.
         /// </summary>
         [Server]
         private void SpawnAttackProjectile(NetworkPlayer attacker, WeaponAttackProfile profile,
@@ -1001,6 +1007,8 @@ namespace RPG.Network
             {
                 Debug.LogWarning($"[Combat] Sem prefab de projétil para {profile.Type}. " +
                                  "Aplicando dano instantâneo como fallback.");
+                CreditDamageToShooter(attacker.netId, damage);
+                ApplyAggroReaction(attacker);
                 RpcShowDamage(damage, crit, ImpactPoint);
                 ApplyDamageInternal(damage);
                 return;
@@ -1019,13 +1027,18 @@ namespace RPG.Network
             {
                 Debug.LogError("[Combat] Projétil prefab não tem componente Projectile!");
                 Destroy(go);
+                // Fallback: aplica dano direto
+                CreditDamageToShooter(attacker.netId, damage);
+                ApplyAggroReaction(attacker);
                 RpcShowDamage(damage, crit, ImpactPoint);
                 ApplyDamageInternal(damage);
                 return;
             }
 
             NetworkServer.Spawn(go);
-            proj.ServerInitialize(this, profile.ProjectileSpeed, damage, crit);
+            // Passa o netId do atacante para o projétil — usado no crédito
+            // de XP no momento do impacto.
+            proj.ServerInitialize(this, attacker.netId, profile.ProjectileSpeed, damage, crit);
         }
 
         private static long BuildBasicAttackCooldownKey(uint attackerNetId, uint monsterNetId)
@@ -1108,8 +1121,7 @@ namespace RPG.Network
             dmg = SanitizeDamage(dmg);
             dmg = Mathf.Max(1f, dmg);
 
-            if (!_damageLog.ContainsKey(attacker.netId)) _damageLog[attacker.netId] = 0f;
-            _damageLog[attacker.netId] += dmg;
+            CreditDamageToShooter(attacker.netId, dmg);
 
             RpcShowDamage(dmg, crit, transform.position);
             ApplyAggroReaction(attacker);
@@ -1117,7 +1129,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Morte e respawn (inalterados)
+        // Morte e respawn
         // ══════════════════════════════════════════════════════════════════
 
         [Server]
@@ -1217,7 +1229,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // ClientRpcs (inalterados)
+        // ClientRpcs
         // ══════════════════════════════════════════════════════════════════
 
         [ClientRpc]

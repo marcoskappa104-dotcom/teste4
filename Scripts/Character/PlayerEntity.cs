@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.AI;
+using UnityEngine.SceneManagement;
 using RPG.Data;
 
 namespace RPG.Character
@@ -9,25 +10,26 @@ namespace RPG.Character
     /// <summary>
     /// Representação local (cliente) do estado do jogador.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (correções de robustez) ===
+    /// === MUDANÇAS DESTA VERSÃO (correções críticas) ===
     ///
-    ///   1. NULL-GUARD EM Stats ANTES DE Clone:
-    ///      SetHPFromServer/SetMPFromServer chamavam Stats.Clone() sem
-    ///      checar se Stats era null. Em casos extremos (RPC chegando
-    ///      antes da inicialização completa), isso crashava com NullRef.
-    ///      Agora retornamos cedo se Stats == null e IsInitialized é a
-    ///      única porta de entrada confiável.
+    ///   1. BUG CORRIGIDO EM ClearTarget:
+    ///      A versão anterior tinha lógica INVERTIDA para detectar alvos
+    ///      destruídos. Quando CurrentTarget era um UnityEngine.Object
+    ///      destruído, o operador == overloaded retornava true (igual a null),
+    ///      então hadTarget=false, e a segunda condição checava obj!=null
+    ///      que TAMBÉM era false — o evento nunca disparava nesse caso.
+    ///      Agora detectamos alvo destruído via try/catch + cleanup garantido.
     ///
-    ///   2. CAMERA CACHE MAIS DEFENSIVO:
-    ///      MainCamera agora trata destruição via operador == do Unity,
-    ///      mas também aceita re-cacheamento em runtime via troca de cena.
+    ///   2. SetTarget EDGE CASE:
+    ///      Comparação `CurrentTarget == target` podia retornar true mesmo
+    ///      com alvo destruído (operador ==), bloqueando re-seleção legítima.
+    ///      Agora consideramos "destruído" como diferente de qualquer alvo novo.
     ///
-    ///   3. ClearTarget IDEMPOTENTE:
-    ///      Antes, ClearTarget early-return se CurrentTarget == null, ok.
-    ///      Mas se CurrentTarget é um UnityEngine.Object destruído, o
-    ///      check `== null` retorna true (operador overloaded), então
-    ///      o evento OnTargetChanged não disparava. Agora detectamos
-    ///      essa situação e disparamos o evento mesmo assim.
+    ///   3. CAMERA CACHE EM SCENE CHANGE:
+    ///      Inscreve-se em sceneLoaded para invalidar cache da Camera.main
+    ///      automaticamente quando há troca de cena (raro, mas defensivo).
+    ///
+    ///   4. NULL-GUARD EM Stats (mantido do refactor anterior).
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class PlayerEntity : MonoBehaviour
@@ -84,8 +86,23 @@ namespace RPG.Character
             _cachedCamera = Camera.main;
         }
 
-        private void OnEnable()  => All.Add(this);
-        private void OnDisable() => All.Remove(this);
+        private void OnEnable()
+        {
+            All.Add(this);
+            SceneManager.sceneLoaded += OnSceneLoaded;
+        }
+
+        private void OnDisable()
+        {
+            All.Remove(this);
+            SceneManager.sceneLoaded -= OnSceneLoaded;
+        }
+
+        private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+        {
+            // Invalida cache; será re-buscado no próximo acesso
+            _cachedCamera = null;
+        }
 
         // ── Inicialização ──────────────────────────────────────────────────
 
@@ -121,7 +138,7 @@ namespace RPG.Character
         public void SetHPFromServer(float hp, float maxHp)
         {
             if (!IsInitialized) return;
-            if (Stats == null) return; // Defesa em profundidade
+            if (Stats == null) return;
 
             bool wasDead = IsDead;
 
@@ -280,31 +297,58 @@ namespace RPG.Character
                 && (!_agent.hasPath || _agent.velocity.sqrMagnitude < 0.01f);
         }
 
-        // ── Alvo ──────────────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════
+        // Target — com correção do bug crítico de detecção de alvo destruído
+        // ══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Verifica se um ITargetable se tornou inválido (destruído pelo Unity).
+        /// Necessário porque o operador == do UnityEngine.Object é overloaded:
+        /// ele retorna `true` quando o objeto foi destruído mesmo que a
+        /// referência C# ainda exista. Para nossa lógica de evento, queremos
+        /// detectar isso explicitamente.
+        /// </summary>
+        private static bool IsTargetUnityDestroyed(ITargetable t)
+        {
+            if (t == null) return false;
+            if (t is UnityEngine.Object obj) return obj == null;
+            return false;
+        }
 
         public void SetTarget(ITargetable target)
         {
-            if (CurrentTarget == target) return;
+            // Se CurrentTarget está destruído, qualquer novo target é diferente
+            bool currentIsDead = IsTargetUnityDestroyed(CurrentTarget);
 
-            // Trata caso em que CurrentTarget é UnityEngine.Object destruído
-            // (o == null já retorna true via operador overloaded, mas a
-            // chamada de método pode crashar)
-            try { CurrentTarget?.OnDeselected(); }
-            catch (MissingReferenceException) { /* alvo destruído — ok */ }
+            if (!currentIsDead && CurrentTarget == target) return;
+
+            // Tenta deselecionar o antigo (pode estar destruído)
+            if (!currentIsDead)
+            {
+                try { CurrentTarget?.OnDeselected(); }
+                catch (MissingReferenceException) { /* destruído entre check e call */ }
+            }
 
             CurrentTarget = target;
-            CurrentTarget?.OnSelected();
+
+            try { CurrentTarget?.OnSelected(); }
+            catch (MissingReferenceException)
+            {
+                // O alvo foi destruído entre SetTarget e OnSelected — descarta
+                CurrentTarget = null;
+                OnTargetChanged?.Invoke(null);
+                return;
+            }
 
             OnTargetChanged?.Invoke(target);
         }
 
         public void ClearTarget()
         {
-            // Detecta também alvos destruídos (operador == overloaded)
-            bool hadTarget = CurrentTarget != null;
-            if (!hadTarget && CurrentTarget is UnityEngine.Object obj && obj != null)
-                hadTarget = true;
-
+            // Considera "tinha alvo" se a referência C# não é null, INDEPENDENTE
+            // de o objeto Unity estar destruído. Assim garantimos que o evento
+            // dispara mesmo quando o monstro/jogador foi destruído.
+            bool hadTarget = !ReferenceEquals(CurrentTarget, null);
             if (!hadTarget) return;
 
             try { CurrentTarget?.OnDeselected(); }

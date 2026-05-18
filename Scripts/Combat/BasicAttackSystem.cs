@@ -23,14 +23,21 @@ namespace RPG.Combat
     ///
     /// === REATIVIDADE ===
     ///   - Inscreve-se em OnEquipmentChanged. Trocar de arma durante auto-ataque
-    ///     atualiza o perfil ativo em tempo real (com cancel suave se a nova
-    ///     arma não tem range).
+    ///     atualiza o perfil ativo em tempo real.
     ///
-    /// === MUDANÇAS PRINCIPAIS VS VERSÃO ANTERIOR ===
-    ///   - attackRange e attackInterval REMOVIDOS dos campos serializados:
-    ///     agora vêm do perfil da arma.
-    ///   - Suporte a projétil (Cmd separado: CmdBasicAttackRanged).
-    ///   - Suporte a custo de mana no básico (cajado, varinha).
+    /// === MUDANÇAS DESTA VERSÃO (correção real) ===
+    ///
+    ///   1. TROCA DE ARMA FORÇA REDIRECT NO PRÓXIMO TICK:
+    ///      A versão anterior detectava troca de arma com range menor mas
+    ///      apenas logava — o loop principal podia não recalcular o destino
+    ///      porque _lastChaseDestination ainda era considerado válido.
+    ///      Agora invalidamos _lastChaseDestination para forçar SetDestination
+    ///      no próximo UpdateAutoAttack, garantindo que o player se reposicione.
+    ///
+    ///   2. RESET DE _attackTimer EM TROCA DE ARMA:
+    ///      Se a nova arma é muito mais lenta/rápida, o timer acumulado da
+    ///      arma antiga não fazia sentido. Resetar dá comportamento previsível
+    ///      (próximo ataque respeita o intervalo da nova arma).
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -182,18 +189,21 @@ namespace RPG.Combat
             var oldProfile = _currentProfile;
             RefreshWeaponProfile();
 
-            // Se trocou pra um tipo de arma muito diferente durante combate,
-            // cancela o auto-ataque pra evitar comportamento inesperado.
-            // Ex: trocar arco por espada com alvo a 10m de distância.
-            if (_autoAttacking && oldProfile != null && _currentProfile != null
-                && _attackTarget != null)
+            // Se trocou de arma durante auto-ataque, forçamos o loop a recalcular
+            // tudo: distância, destino, timing. Sem isso, _lastChaseDestination
+            // pode bloquear SetDestination quando o range da nova arma é diferente.
+            if (_autoAttacking && oldProfile != _currentProfile)
             {
-                float dist = Vector3.Distance(transform.position, _attackTarget.Position);
-                float newRange = _currentProfile.Range * RANGE_CHECK_MARGIN;
-                if (dist > newRange)
+                _lastChaseDestination = Vector3.positiveInfinity;
+                _attackTimer          = GetAttackInterval(); // próximo ataque respeita nova ASPD
+
+                if (_attackTarget != null && _currentProfile != null)
                 {
-                    Log($"Mudança de arma deixou alvo fora de range — perseguindo com novo range {_currentProfile.Range:0.0}.");
-                    // Não cancela; o loop principal vai reposicionar.
+                    float dist = Vector3.Distance(transform.position, _attackTarget.Position);
+                    if (dist > _currentProfile.Range * RANGE_CHECK_MARGIN)
+                        Log($"Troca de arma → alvo a {dist:0.0}m, novo range {_currentProfile.Range:0.0}m. Reposicionando.");
+                    else
+                        Log($"Troca de arma → ainda em range.");
                 }
             }
         }
@@ -415,9 +425,6 @@ namespace RPG.Combat
 
             // Servidor já conhece a arma e perfil — o cliente envia apenas
             // a INTENÇÃO. O servidor valida e aplica.
-            //
-            // Cmd único para ambos tipos: servidor decide melee/projétil
-            // baseado no perfil real da arma equipada (não confia no cliente).
             _attackTarget.CmdBasicAttack(_identity.netId, _currentProfile.Range);
 
             Log($"CmdBasicAttack → {_attackTarget.DisplayName} (perfil: {_currentProfile.Type})");

@@ -10,21 +10,31 @@ namespace RPG.Network
     /// destrói o projétil.
     ///
     /// === DESIGN ===
-    ///   - O DANO já foi calculado quando o projétil nasceu (no momento do ataque).
-    ///     Isso é deliberado: garante que o resultado é coerente com os stats
-    ///     do atacante naquele instante, mesmo se ele morrer enquanto o projétil
-    ///     voa, ou se o alvo trocar de armadura.
+    ///   - O DANO já foi calculado quando o projétil nasceu. Isso garante que
+    ///     o resultado é coerente com os stats do atacante naquele instante,
+    ///     mesmo se ele morrer enquanto o projétil voa.
     ///   - O HOMING é leve: o projétil ajusta a direção a cada frame para seguir
     ///     o alvo, mas com velocidade angular limitada. Se o alvo morrer ou
     ///     for muito longe, segue em linha reta e morre por timeout.
     ///   - Não usa colliders/Rigidbody — distância manual é mais determinística
     ///     em multiplayer e mais barata.
+    ///   - O ShooterNetId é sincronizado para que NetworkMonsterEntity possa
+    ///     creditar XP corretamente no impacto (não no disparo).
     ///
-    /// === COMO USAR ===
-    /// 1. Prefab precisa de: NetworkIdentity, NetworkTransform (para sync visual),
-    ///    e este componente. Sem Rigidbody.
-    /// 2. Registre o prefab no RPGNetworkManager.spawnablePrefabs.
-    /// 3. O servidor chama ServerInitialize(...) imediatamente após NetworkServer.Spawn.
+    /// === MUDANÇAS DESTA VERSÃO ===
+    ///
+    ///   1. SHOOTER NET ID CARREGADO NO PROJÉTIL:
+    ///      Para que o XP seja creditado SOMENTE quando o dano é aplicado
+    ///      (e não quando o projétil é disparado), o atacante precisa ser
+    ///      identificável no momento do impacto. ShooterNetId é SyncVar.
+    ///
+    ///   2. ROTAÇÃO DEFENSIVA NO CLIENTE:
+    ///      OnStartClient setava transform.rotation = LookRotation(_initialDirection)
+    ///      sem garantir que _initialDirection era não-zero. Quando ServerInitialize
+    ///      é chamado APÓS NetworkServer.Spawn (caso normal), o cliente pode
+    ///      receber o Spawn antes da SyncVar estar populada → Vector3.zero
+    ///      → warning "look rotation viewing vector is zero".
+    ///      Agora checamos sqrMagnitude antes de usar.
     /// </summary>
     [RequireComponent(typeof(NetworkIdentity))]
     public class Projectile : NetworkBehaviour
@@ -45,6 +55,7 @@ namespace RPG.Network
         // ── Dados de runtime (apenas servidor escreve; SyncVars para client follow) ──
 
         [SyncVar] private uint    _targetNetId;
+        [SyncVar] private uint    _shooterNetId;
         [SyncVar] private Vector3 _initialDirection;
 
         // Estado lógico só no servidor
@@ -65,11 +76,16 @@ namespace RPG.Network
         /// <summary>
         /// Inicializa o projétil no servidor. DEVE ser chamado IMEDIATAMENTE
         /// após NetworkServer.Spawn(prefab).
+        ///
+        /// shooterNetId é usado para creditar XP no momento do impacto
+        /// (não do disparo).
         /// </summary>
         [Server]
-        public void ServerInitialize(NetworkBehaviour target, float speed, float damage, bool crit)
+        public void ServerInitialize(NetworkBehaviour target, uint shooterNetId,
+                                     float speed, float damage, bool crit)
         {
             _serverTarget     = target;
+            _shooterNetId     = shooterNetId;
             _speed            = Mathf.Max(1f, speed);
             _damage           = Mathf.Max(0f, damage);
             _crit             = crit;
@@ -101,7 +117,10 @@ namespace RPG.Network
         public override void OnStartClient()
         {
             _clientSpawnTime = Time.time;
-            // Cliente alinha o yaw inicial; o resto vem via NetworkTransform
+
+            // Defensivo: _initialDirection pode estar zerado se a SyncVar
+            // ainda não tiver propagado (raro mas possível). Só aplica
+            // rotação se direção é não-zero.
             if (_initialDirection.sqrMagnitude > 0.001f)
                 transform.rotation = Quaternion.LookRotation(_initialDirection);
         }
@@ -112,28 +131,21 @@ namespace RPG.Network
 
         private void Update()
         {
-            // Servidor: lógica autoritativa de movimento e impacto
             if (isServer)
             {
                 ServerUpdate();
                 return;
             }
 
-            // Cliente sem NetworkTransform: movimento dead-reckoning suave
-            // (caso NetworkTransform esteja configurado no prefab, isso será sobrescrito)
+            // Cliente: failsafe se o servidor não destruiu por algum motivo
             if (Time.time - _clientSpawnTime > maxLifetime + 0.5f)
-            {
-                // Failsafe: cliente nunca deve destruir o objeto, mas se está
-                // muito além do tempo de vida e o servidor não destruiu,
-                // ao menos esconde para não acumular visual.
                 gameObject.SetActive(false);
-            }
         }
 
         [Server]
         private void ServerUpdate()
         {
-            // Timeout: nunca passa do maxLifetime
+            // Timeout
             if (Time.time - _spawnTime > maxLifetime)
             {
                 NetworkServer.Destroy(gameObject);
@@ -142,7 +154,7 @@ namespace RPG.Network
 
             Vector3 desiredDir = _initialDirection;
 
-            // Homing leve: se o alvo ainda existe e está vivo, atualizamos a direção
+            // Homing leve
             if (_serverTarget != null && !TargetIsDeadOrGone(_serverTarget))
             {
                 Vector3 toTarget = _serverTarget.transform.position - transform.position;
@@ -153,7 +165,6 @@ namespace RPG.Network
                 {
                     desiredDir = toTarget.normalized;
 
-                    // Impacto?
                     if (sqr <= impactDistance * impactDistance)
                     {
                         ApplyImpact();
@@ -162,7 +173,7 @@ namespace RPG.Network
                 }
             }
 
-            // Rotação clamped (homing suave)
+            // Rotação clamped
             Vector3 currentForward = transform.forward;
             currentForward.y = 0f;
             if (currentForward.sqrMagnitude > 0.001f)
@@ -198,17 +209,15 @@ namespace RPG.Network
             if (_hitProcessed) return;
             _hitProcessed = true;
 
-            // Aplica dano dependendo do tipo de alvo
+            // Aplica dano dependendo do tipo de alvo, passando o shooter netId
+            // para que o XP seja creditado corretamente.
             if (_serverTarget is NetworkMonsterEntity monster && !monster.IsDead)
             {
-                // Não passa pelo pipeline normal porque o dano já foi calculado.
-                // Usamos a API server-side direta para aplicar e mostrar feedback.
-                monster.ServerTakeProjectileDamage(_damage, _crit);
+                monster.ServerTakeProjectileDamage(_shooterNetId, _damage, _crit);
             }
             else if (_serverTarget is NetworkPlayer player && !player.Dead)
             {
-                // (Reservado para PvP futuro — atualmente projéteis monstro→player
-                // não usam essa rota, mas a integração está pronta.)
+                // Reservado para PvP futuro
                 player.ServerApplyDamageWithFeedback(_damage);
             }
 

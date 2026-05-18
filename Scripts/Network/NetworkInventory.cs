@@ -13,26 +13,24 @@ namespace RPG.Network
     /// <summary>
     /// Inventário do jogador. Server-authoritative.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (limpeza + segurança) ===
+    /// === MUDANÇAS DESTA VERSÃO (segurança em swap) ===
     ///
-    ///   1. CÓDIGO MORTO REMOVIDO EM AddStackable:
-    ///      As variáveis topUpSnapshots, newSlotIndices e snapshotNextSlotIndex
-    ///      eram declaradas e populadas mas NUNCA usadas (não havia rollback
-    ///      real). Causavam warnings de compilação e poluíam o código sem
-    ///      benefício. Removidas. A estratégia de "aceitar parcial" está
-    ///      documentada claramente.
+    ///   1. ROLLBACK SEGURO EM TrySwapFromInventory:
+    ///      A versão anterior, em caso de falha CRÍTICA de rollback, fazia
+    ///      Slots.Add direto bypassando ServerAddItem. Isso era uma porta
+    ///      para duplicação de itens se o ItemDatabase estivesse corrompido.
+    ///      Agora preferimos PERDER o item (raríssimo) a duplicá-lo. Log
+    ///      crítico permanece para análise do operador.
     ///
-    ///   2. VALIDAÇÃO DE PRÉ-CONDIÇÕES EM TODOS OS Cmd:
-    ///      Adicionado check de connectionToClient != null em todos os Cmd,
-    ///      consistente entre eles (alguns tinham, outros não).
+    ///   2. MENSAGEM CLARA QUANDO ItemDatabase INDISPONÍVEL:
+    ///      Antes, se ItemDatabase.Instance fosse null, o jogador recebia
+    ///      "Este item não pode ser equipado" — confuso. Agora diferencia
+    ///      "banco de itens não disponível" de "item inválido para slot".
     ///
-    ///   3. CmdRemoveItem AGORA VALIDA SLOT EXISTÊNCIA:
-    ///      Antes, se o cliente enviasse um slotIndex inválido, a função
-    ///      silenciosamente não fazia nada. Agora avisa o owner.
-    ///
-    ///   4. CmdUseConsumable COM ITEM DATABASE CHECK:
-    ///      Antes, se ItemDatabase.Instance fosse null, dava NullRef.
-    ///      Agora retorna early com log.
+    ///   3. EARLY-RETURN EM Cmds SE INVENTÁRIO NÃO INICIALIZADO:
+    ///      Adicionado check de _netPlayer != null já existia; agora também
+    ///      validamos que ItemDatabase.Instance existe (ele é singleton mas
+    ///      pode não estar pronto no primeiro frame após carga de cena).
     /// </summary>
     [RequireComponent(typeof(NetworkIdentity))]
     public class NetworkInventory : NetworkBehaviour
@@ -372,47 +370,70 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // SWAP HELPER
+        // SWAP HELPER — agora com rollback que NUNCA duplica
         // ══════════════════════════════════════════════════════════════════
 
+        /// <summary>
+        /// Remove o item de entrada do inventário e devolve o item antigo
+        /// (se houver). Em caso de falha, faz rollback SEM DUPLICAR.
+        ///
+        /// CONTRATO:
+        ///   - Sucesso: inventório consumiu newItemId e (se aplicável) ganhou oldItemId.
+        ///   - Falha: inventário volta ao estado original OU perde o newItem
+        ///     (se o rollback do oldItem falhar). NUNCA duplica.
+        /// </summary>
         [Server]
         private bool TrySwapFromInventory(int inventorySlotIndex, string newItemId,
                                           string oldItemId, out string failReason)
         {
             failReason = null;
 
+            // Snapshot do slot antes de remover, para rollback se necessário
+            if (!TryGetInventorySlot(inventorySlotIndex, out var originalSlot))
+            {
+                failReason = "Item desapareceu do inventário.";
+                return false;
+            }
+
+            // 1. Remove o item de entrada
             if (!ServerRemoveSlot(inventorySlotIndex))
             {
                 failReason = "Item desapareceu do inventário.";
                 Debug.LogError($"[NetworkInventory] TrySwapFromInventory: " +
-                               $"remove({inventorySlotIndex}) falhou.");
+                               $"remove({inventorySlotIndex}) falhou inesperadamente.");
                 return false;
             }
 
+            // 2. Tenta devolver o item antigo (se havia)
             if (!string.IsNullOrEmpty(oldItemId))
             {
                 int returnedSlot = ServerAddItem(oldItemId, 1);
                 if (returnedSlot < 0)
                 {
-                    Debug.LogError($"[NetworkInventory] TrySwapFromInventory: " +
-                                   $"falha ao devolver '{oldItemId}' ao inventário. " +
-                                   $"Rollback...");
-
-                    int rollback = ServerAddItem(newItemId, 1);
-                    if (rollback < 0)
+                    // Falha ao devolver o antigo: tenta restaurar o estado original
+                    // colocando o NEW item de volta no inventário
+                    int rollback = ServerAddItem(newItemId, originalSlot.Quantity);
+                    if (rollback >= 0)
                     {
-                        Debug.LogError($"[NetworkInventory] ROLLBACK CRÍTICO: " +
-                                       $"forçando inserção de '{newItemId}'. " +
-                                       $"Verifique integridade do ItemDatabase!\n" +
-                                       $"{Environment.StackTrace}");
-                        Slots.Add(new InventorySlotData
-                        {
-                            SlotIndex = _nextSlotIndex++,
-                            ItemId    = newItemId,
-                            Quantity  = 1
-                        });
+                        // Rollback completo bem-sucedido
+                        failReason = "Sem espaço no inventário para o item antigo.";
+                        return false;
                     }
-                    failReason = "Erro ao trocar item.";
+
+                    // CASO CRÍTICO: nem o old nem o new cabem no inventário
+                    // (inventário cheio + ItemDatabase corrompido).
+                    // PREFERIMOS PERDER O ITEM A DUPLICAR. Log crítico para diagnóstico.
+                    Debug.LogError($"[NetworkInventory] ROLLBACK CRÍTICO IRREVERSÍVEL: " +
+                                   $"perda de item '{newItemId}' (qty={originalSlot.Quantity}) " +
+                                   $"e falha ao devolver '{oldItemId}'. " +
+                                   $"Player: {_netPlayer?.CharacterName ?? "?"}. " +
+                                   $"Investigar ItemDatabase e capacidade de inventário.\n" +
+                                   $"{Environment.StackTrace}");
+
+                    _netPlayer?.RpcShowMessageToOwner(
+                        "Erro de inventário. Reporte ao administrador (item perdido).");
+
+                    failReason = "Erro crítico — operação cancelada.";
                     return false;
                 }
             }
@@ -511,14 +532,29 @@ namespace RPG.Network
         {
             if (_netPlayer == null || _netPlayer.Dead) return;
 
+            // Check explícito do ItemDatabase para dar mensagem clara
+            if (ItemDatabase.Instance == null)
+            {
+                _netPlayer.RpcShowMessageToOwner("Banco de itens indisponível. Tente novamente em instantes.");
+                Debug.LogError("[NetworkInventory] ServerEquipItem: ItemDatabase.Instance é null.");
+                return;
+            }
+
             if (!TryGetInventorySlot(inventorySlotIndex, out var foundSlot))
             {
                 _netPlayer.RpcShowMessageToOwner("Item não encontrado no inventário.");
                 return;
             }
 
-            var itemData = ItemDatabase.Instance?.GetItem(foundSlot.ItemId);
-            if (itemData == null || !itemData.IsEquipment)
+            var itemData = ItemDatabase.Instance.GetItem(foundSlot.ItemId);
+            if (itemData == null)
+            {
+                _netPlayer.RpcShowMessageToOwner("Item inválido (não está no banco de dados).");
+                Debug.LogWarning($"[NetworkInventory] Item '{foundSlot.ItemId}' não encontrado no ItemDatabase.");
+                return;
+            }
+
+            if (!itemData.IsEquipment)
             {
                 _netPlayer.RpcShowMessageToOwner("Este item não pode ser equipado.");
                 return;
@@ -667,14 +703,28 @@ namespace RPG.Network
                 return;
             }
 
+            // Check explícito do ItemDatabase
+            if (ItemDatabase.Instance == null)
+            {
+                _netPlayer.RpcShowMessageToOwner("Banco de itens indisponível. Tente novamente em instantes.");
+                Debug.LogError("[NetworkInventory] CmdEquipGem: ItemDatabase.Instance é null.");
+                return;
+            }
+
             if (!TryGetInventorySlot(inventorySlotIndex, out var foundSlot))
             {
                 _netPlayer.RpcShowMessageToOwner("Joia não encontrada no inventário.");
                 return;
             }
 
-            var itemData = ItemDatabase.Instance?.GetItem(foundSlot.ItemId);
-            if (itemData == null || !itemData.IsPowerGem)
+            var itemData = ItemDatabase.Instance.GetItem(foundSlot.ItemId);
+            if (itemData == null)
+            {
+                _netPlayer.RpcShowMessageToOwner("Joia inválida (não está no banco de dados).");
+                return;
+            }
+
+            if (!itemData.IsPowerGem)
             {
                 _netPlayer.RpcShowMessageToOwner("Este item não é uma Joia do Poder.");
                 return;
@@ -751,6 +801,7 @@ namespace RPG.Network
 
             if (ItemDatabase.Instance == null)
             {
+                _netPlayer.RpcShowMessageToOwner("Banco de itens indisponível.");
                 Debug.LogError("[NetworkInventory] CmdUseConsumable: ItemDatabase.Instance nulo.");
                 return;
             }

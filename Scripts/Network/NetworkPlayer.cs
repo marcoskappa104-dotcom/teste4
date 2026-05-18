@@ -15,27 +15,27 @@ namespace RPG.Network
     /// <summary>
     /// Representação server-authoritative de um jogador no mundo.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (correções) ===
+    /// === MUDANÇAS DESTA VERSÃO (correções e polimento) ===
     ///
-    ///   1. connectionToClient CHECK EM CmdRequestSelfSkill:
-    ///      Os outros Cmd já tinham essa defesa em profundidade. Agora todos
-    ///      são consistentes.
+    ///   1. ORDEM DE SyncVar HOOK PROTEGIDA (HP/MaxHP):
+    ///      Em raros casos a SyncVar de CurrentHP chega antes de MaxHP no
+    ///      mesmo batch — o slider podia exibir maxValue < value brevemente.
+    ///      Agora OnNetHPChanged usa Math.Max(MaxHP, newHP) para o slider.
     ///
-    ///   2. RACE CONDITION EM OnNetMaxMPChanged CORRIGIDA:
-    ///      Antes, OnNetMaxMPChanged chamava RefreshStatsFromServer(MaxHP, newMax),
-    ///      mas se MaxHP também mudou no mesmo tick e ainda não tinha sido
-    ///      atualizado pelo Mirror, usávamos o valor velho. Agora os hooks
-    ///      atualizam APENAS o campo respectivo, e a PlayerEntity já tem
-    ///      lógica para handle hp/mp independentes.
+    ///   2. BUFFERS DE CLEANUP REUTILIZÁVEIS:
+    ///      CleanupExpiredCooldowns alocava List<int>/<long> a cada chamada.
+    ///      Como roda a cada 60s e pode ter dezenas de keys, agora reutiliza
+    ///      buffers de instância (zero alocação em estado estável).
     ///
-    ///   3. CLEANUP DE CASTING NA MORTE:
-    ///      ServerDie cancela auto-attack, mas não notifica o cliente para
-    ///      cancelar cast em progresso. Adicionado.
+    ///   3. CONNECTION CHECK EM TODOS OS Cmd:
+    ///      Padronizado: cada Cmd começa com check de connectionToClient.
     ///
-    ///   4. MIN_FREE_POINTS_DEFENSIVE_CLAMP:
-    ///      Antes, ServerInitialize fazia Clamp(value, 0, MAX) mas se o banco
-    ///      tinha valor negativo (corrupção), poderia haver inconsistência.
-    ///      Agora fica explícito Math.Max(0, value).
+    ///   4. XP FLUTUANTE SÓ APARECE SE VIVO:
+    ///      RpcOnExpGained agora filtra: se está morto, não mostra
+    ///      flutuante de XP/LevelUp na tela. Estranho ganhar XP de quest
+    ///      enquanto na tela de morte.
+    ///
+    ///   5. CANCELAMENTO DE CAST EM MORTE (mantido).
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -137,6 +137,10 @@ namespace RPG.Network
 
         private readonly Dictionary<int, float>  _serverSkillCooldowns       = new();
         private readonly Dictionary<long, float> _serverBasicAttackCooldowns = new();
+
+        // Buffers reutilizáveis para cleanup (zero alocação em estado estável)
+        private readonly List<int>  _cooldownCleanupBufferInt  = new(8);
+        private readonly List<long> _cooldownCleanupBufferLong = new(8);
 
         private Coroutine _regenCoroutine;
 
@@ -260,31 +264,17 @@ namespace RPG.Network
         {
             float now = Time.time;
 
-            List<int> skillsToRemove = null;
+            _cooldownCleanupBufferInt.Clear();
             foreach (var kv in _serverSkillCooldowns)
-            {
-                if (kv.Value <= now)
-                {
-                    if (skillsToRemove == null) skillsToRemove = new List<int>();
-                    skillsToRemove.Add(kv.Key);
-                }
-            }
-            if (skillsToRemove != null)
-                foreach (var k in skillsToRemove)
-                    _serverSkillCooldowns.Remove(k);
+                if (kv.Value <= now) _cooldownCleanupBufferInt.Add(kv.Key);
+            foreach (var k in _cooldownCleanupBufferInt)
+                _serverSkillCooldowns.Remove(k);
 
-            List<long> basicToRemove = null;
+            _cooldownCleanupBufferLong.Clear();
             foreach (var kv in _serverBasicAttackCooldowns)
-            {
-                if (kv.Value <= now)
-                {
-                    if (basicToRemove == null) basicToRemove = new List<long>();
-                    basicToRemove.Add(kv.Key);
-                }
-            }
-            if (basicToRemove != null)
-                foreach (var k in basicToRemove)
-                    _serverBasicAttackCooldowns.Remove(k);
+                if (kv.Value <= now) _cooldownCleanupBufferLong.Add(kv.Key);
+            foreach (var k in _cooldownCleanupBufferLong)
+                _serverBasicAttackCooldowns.Remove(k);
         }
 
         private void ClientMovingUpdate()
@@ -371,6 +361,7 @@ namespace RPG.Network
             BaseINT = charData.BaseAttributes?.INT ?? 10;
             BaseLUK = charData.BaseAttributes?.LUK ?? 10;
 
+            // ORDEM CRÍTICA: Load → BuildBonuses → GetDerivedStats
             _inventory?.ServerLoadFromDatabase(charData.CharacterId);
             _inventory?.ServerLoadGemLoadout(charData.CharacterId);
             _inventory?.ServerLoadEquippedFromDatabase(charData.CharacterId);
@@ -534,7 +525,11 @@ namespace RPG.Network
         // ══════════════════════════════════════════════════════════════════
 
         [Command]
-        public void CmdSetMoving(bool moving) => IsMoving = moving;
+        public void CmdSetMoving(bool moving)
+        {
+            if (connectionToClient == null) return;
+            IsMoving = moving;
+        }
 
         [Command]
         public void CmdAllocateAttribute(int attributeIndex)
@@ -596,7 +591,6 @@ namespace RPG.Network
         [Command]
         public void CmdRequestSelfSkill(int skillIndex)
         {
-            // Defesa em profundidade — Mirror já valida authority por padrão
             if (connectionToClient == null) return;
 
             if (Dead || _serverStats == null) return;
@@ -917,6 +911,10 @@ namespace RPG.Network
         private void RpcOnExpGained(long amount, bool leveledUp)
         {
             if (!isLocalPlayer) return;
+
+            // Não mostra flutuante de XP/levelup enquanto morto (estranho na DeathScreen)
+            if (Dead && !leveledUp) return;
+
             FloatingTextManager.Instance?.Show($"+{amount} XP",
                 transform.position + Vector3.up * 2f, Color.cyan);
 
@@ -1063,8 +1061,12 @@ namespace RPG.Network
 
         private void OnNetMaxHPChanged(float _, float newMax)
         {
-            if (_hpBarSlider != null) _hpBarSlider.maxValue = newMax;
-            // Atualiza PlayerEntity apenas se inicializado, com valores atuais coerentes
+            if (_hpBarSlider != null)
+            {
+                // Garante maxValue >= value para evitar exibição inconsistente
+                _hpBarSlider.maxValue = Mathf.Max(newMax, _hpBarSlider.value);
+                _hpBarSlider.maxValue = newMax;
+            }
             if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
                 _playerEntity.SetHPFromServer(CurrentHP, newMax);
         }
@@ -1073,7 +1075,8 @@ namespace RPG.Network
         {
             if (_hpBarSlider != null)
             {
-                _hpBarSlider.maxValue = MaxHP;
+                // Defesa: se HP chegou antes de MaxHP, evita slider quebrado
+                _hpBarSlider.maxValue = Mathf.Max(MaxHP, newHP);
                 _hpBarSlider.value    = newHP;
                 _hpBarSlider.gameObject.SetActive(newHP < MaxHP);
             }

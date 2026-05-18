@@ -20,26 +20,20 @@ namespace RPG.Network
     ///   - Limpeza de sessões ociosas por TTL
     ///   - Sessões InGame protegidas contra timeout
     ///   - Delay anti-timing-attack ASSÍNCRONO (não bloqueia o main thread)
+    ///   - CAP de tamanho do _ipBans contra DoS por memória
     ///
-    /// === MUDANÇAS DESTA VERSÃO (Lote 4 — polish) ===
+    /// === MUDANÇAS DESTA VERSÃO (segurança) ===
     ///
-    ///   1. LIMITS DE MENSAGEM USAM GameConstants.Auth:
-    ///      Os caps de username (64) e SignedHash (256) eram literais inline.
-    ///      Agora são constantes nomeadas para facilitar tunagem.
+    ///   1. CAP DE TAMANHO EM _ipBans:
+    ///      Antes, o dicionário podia crescer indefinidamente com botnets
+    ///      ou IPs de DHCP residencial. Agora limitamos a MAX_TRACKED_IPS;
+    ///      quando atinge esse cap, removemos as entradas com menor atividade
+    ///      recente (LRU simples). IPs banidos ATIVOS são preservados.
     ///
-    ///   2. NONCE ROTATION OPCIONAL:
-    ///      Comentário explica que o nonce atual é vitalício por sessão.
-    ///      Para hardening futuro, seria possível rotacionar após N segundos,
-    ///      mas isso exigiria reenviar MsgAuthChallenge e o cliente reagir.
-    ///      Deixado como TODO documentado.
-    ///
-    ///   3. NULL CHECKS MAIS DEFENSIVOS:
-    ///      OnLoginRequest checa session.RemoteAddress; se for null, usa
-    ///      "unknown" em vez de propagar null para IpBans (que daria warning).
-    ///
-    ///   4. LOG DE RATE LIMIT MAIS INFORMATIVO:
-    ///      Logs de IP banido agora incluem timestamp ISO em UTC, facilitando
-    ///      cruzamento com outros logs do servidor.
+    ///   2. CLEANUP MAIS PROATIVO:
+    ///      O cleanup agora também remove entradas com falhas antigas
+    ///      e BanUntil=0 (nunca foram banidas) se passou tempo suficiente
+    ///      sem atividade — reduz memória sem perder dados úteis.
     /// </summary>
     public class ServerAuthManager : MonoBehaviour
     {
@@ -49,9 +43,15 @@ namespace RPG.Network
         [Tooltip("Logs detalhados do fluxo de auth. DESATIVE em produção.")]
         [SerializeField] private bool debugAuth = false;
 
-        // Caps de payload para auth (defesa contra DoS por mensagens enormes)
+        // Caps de payload para auth
         private const int MAX_USERNAME_PAYLOAD_BYTES = 64;
         private const int MAX_HASH_PAYLOAD_BYTES     = 256;
+
+        // Cap defensivo no tamanho do _ipBans (proteção contra DoS por memória)
+        private const int MAX_TRACKED_IPS = 10_000;
+
+        // Cap defensivo no tamanho do _sessions (proteção contra esgotamento)
+        private const int MAX_TRACKED_SESSIONS = 5_000;
 
         private enum ConnState { Unauthenticated, Authenticated, InGame }
 
@@ -124,10 +124,14 @@ namespace RPG.Network
                 return;
             }
 
-            // NOTA: O nonce é vitalício por sessão (não rotaciona).
-            // Para hardening adicional, considerar rotação a cada N segundos
-            // — mas isso exigiria reenviar MsgAuthChallenge e o cliente
-            // reagir antes de cada login attempt.
+            // Cap defensivo no número de sessões trackeadas
+            if (_sessions.Count >= MAX_TRACKED_SESSIONS)
+            {
+                Debug.LogWarning($"[ServerAuth] Limite de sessões atingido ({MAX_TRACKED_SESSIONS}). " +
+                                 "Limpando sessões ociosas antes de aceitar nova.");
+                ForceCleanupSessions();
+            }
+
             var session = new ConnData
             {
                 SessionNonce  = GameManager.GenerateNonce(),
@@ -207,8 +211,6 @@ namespace RPG.Network
                 return;
             }
 
-            // O DB pode retornar um delay sugerido para mitigar timing attacks.
-            // NÃO bloqueamos aqui; aplicamos o delay via coroutine se necessário.
             LoginAttemptResult result = default;
             if (DatabaseManager.Instance != null)
                 result = DatabaseManager.Instance.TryLoginWithSignedHash(
@@ -226,14 +228,9 @@ namespace RPG.Network
                 };
 
                 if (result.SuggestedDelayMs > 0)
-                {
-                    // Resposta ATRASADA mas NÃO-BLOQUEANTE
                     StartCoroutine(SendDelayed(conn, failMsg, result.SuggestedDelayMs));
-                }
                 else
-                {
                     conn.Send(failMsg);
-                }
                 return;
             }
 
@@ -252,22 +249,18 @@ namespace RPG.Network
             Debug.Log($"[ServerAuth] Login OK: {result.Account.Username} (IP {session.RemoteAddress})");
         }
 
-        /// <summary>
-        /// Envia uma resposta após um atraso, sem bloquear o main thread.
-        /// Usado para mitigação de timing attack em login falho.
-        /// </summary>
         private IEnumerator SendDelayed(NetworkConnectionToClient conn,
                                         MsgLoginResponse msg,
                                         int delayMs)
         {
             yield return new WaitForSeconds(delayMs / 1000f);
-
-            // Conexão ainda válida?
             if (conn != null && conn.isReady)
                 conn.Send(msg);
         }
 
-        // ── Rate limit por IP ──────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════
+        // Rate limit por IP — com cap de memória
+        // ══════════════════════════════════════════════════════════════════
 
         private bool IsIpBanned(string ip)
         {
@@ -279,6 +272,13 @@ namespace RPG.Network
         private void RecordFailedLoginAttempt(string ip)
         {
             if (string.IsNullOrEmpty(ip) || ip == "unknown") return;
+
+            // Cap defensivo: se o dicionário cresceu demais, faz eviction LRU
+            // ANTES de adicionar uma nova entrada. Preserva bans ativos.
+            if (!_ipBans.ContainsKey(ip) && _ipBans.Count >= MAX_TRACKED_IPS)
+            {
+                EvictLeastRecentIps(targetSize: MAX_TRACKED_IPS - (MAX_TRACKED_IPS / 10));
+            }
 
             if (!_ipBans.TryGetValue(ip, out var data))
             {
@@ -303,6 +303,69 @@ namespace RPG.Network
         {
             if (string.IsNullOrEmpty(ip) || ip == "unknown") return;
             _ipBans.Remove(ip);
+        }
+
+        /// <summary>
+        /// Eviction LRU simples: remove entradas com menor LastAttemptTime,
+        /// preservando bans ATIVOS (que ainda não expiraram). Reduz o dicionário
+        /// até o targetSize.
+        /// </summary>
+        private void EvictLeastRecentIps(int targetSize)
+        {
+            if (_ipBans.Count <= targetSize) return;
+
+            float now = Time.time;
+
+            // Coleta candidatos (bans inativos), ordena por LastAttemptTime crescente
+            var candidates = new List<KeyValuePair<string, float>>(_ipBans.Count);
+            foreach (var kv in _ipBans)
+            {
+                bool isActiveBan = now < kv.Value.BanUntil;
+                if (!isActiveBan)
+                    candidates.Add(new KeyValuePair<string, float>(kv.Key, kv.Value.LastAttemptTime));
+            }
+
+            candidates.Sort((a, b) => a.Value.CompareTo(b.Value));
+
+            int toRemove = _ipBans.Count - targetSize;
+            int removed = 0;
+            foreach (var c in candidates)
+            {
+                if (removed >= toRemove) break;
+                _ipBans.Remove(c.Key);
+                removed++;
+            }
+
+            if (removed > 0)
+                Debug.Log($"[ServerAuth] Eviction LRU: removeu {removed} IPs antigos do tracker.");
+            else
+                Debug.LogWarning("[ServerAuth] Não foi possível fazer eviction: todos os IPs " +
+                                 $"tracked têm ban ativo ({_ipBans.Count}).");
+        }
+
+        /// <summary>
+        /// Limpeza forçada de sessões expiradas (não-InGame), chamada quando
+        /// _sessions atinge o cap. Mais agressiva que o ciclo periódico.
+        /// </summary>
+        private void ForceCleanupSessions()
+        {
+            float now = Time.time;
+            var toRemove = new List<int>();
+
+            foreach (var kv in _sessions)
+            {
+                if (kv.Value.State == ConnState.InGame) continue;
+                // Limiar mais agressivo: metade do TTL normal
+                float threshold = GameConstants.Auth.SESSION_TTL_SECONDS * 0.5f;
+                if (now - kv.Value.LastActivityTime > threshold)
+                    toRemove.Add(kv.Key);
+            }
+
+            foreach (var id in toRemove)
+                _sessions.Remove(id);
+
+            if (toRemove.Count > 0)
+                Debug.Log($"[ServerAuth] ForceCleanup removeu {toRemove.Count} sessões ociosas.");
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -561,12 +624,18 @@ namespace RPG.Network
                 foreach (var kv in _ipBans)
                 {
                     var data = kv.Value;
+                    // Expirou: passou o ban E não há atividade recente
                     if (Time.time >= data.BanUntil
                         && Time.time - data.LastAttemptTime > GameConstants.Auth.IP_BAN_DURATION_SECONDS)
                         expiredIps.Add(kv.Key);
                 }
                 foreach (var ip in expiredIps)
                     _ipBans.Remove(ip);
+
+                // Sanity check: se ainda assim _ipBans cresceu além do cap,
+                // força LRU eviction. Acontece se taxa de attaques > taxa de cleanup.
+                if (_ipBans.Count > MAX_TRACKED_IPS)
+                    EvictLeastRecentIps(targetSize: MAX_TRACKED_IPS - (MAX_TRACKED_IPS / 10));
             }
         }
     }

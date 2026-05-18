@@ -11,10 +11,14 @@ namespace RPG.UI
     /// <summary>
     /// ItemTooltipUI — tooltip com seções dinâmicas.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (sistema de stacking) ===
-    ///   - Consumable section agora mostra "Empilha até X" para deixar
-    ///     claro o tamanho do stack.
-    ///   - Adicionada linha de stack info para itens Misc também.
+    /// === MUDANÇAS DESTA VERSÃO (perf em hover) ===
+    ///
+    ///   1. USA NetworkPlayer.GetRaceEnum():
+    ///      Antes, TryGetLocalPlayerStats fazia Enum.TryParse<CharacterRace>
+    ///      em cada hover — string parsing aloca. Em hovers rápidos isso ia
+    ///      pro GC.
+    ///      Agora consulta GetRaceEnum() que retorna o cached _cachedRace
+    ///      do NetworkPlayer (atualizado quando RaceStr muda via SyncVar hook).
     /// </summary>
     public class ItemTooltipUI : MonoBehaviour
     {
@@ -297,6 +301,10 @@ namespace RPG.UI
                 ? $"<color=#88FF88>✓ {text}</color>"
                 : $"<color=#FF6666>✗ {text}</color>";
 
+        /// <summary>
+        /// Lê stats do jogador local SEM alocar. Usa GetRaceEnum() do
+        /// NetworkPlayer (que mantém _cachedRace) em vez de Enum.TryParse.
+        /// </summary>
         private static bool TryGetLocalPlayerStats(out int level, out int str, out int agi, out int vit,
                                                    out int dex, out int intt, out int luk,
                                                    out CharacterRace race)
@@ -311,9 +319,7 @@ namespace RPG.UI
             if (np == null) return false;
 
             level = np.Level;
-
-            if (!System.Enum.TryParse<CharacterRace>(np.RaceStr, out race))
-                race = CharacterRace.Human;
+            race  = np.GetRaceEnum(); // SEM ALOCAÇÃO
 
             var raceBonus = StatsCalculator.GetRaceBonus(race);
 
@@ -351,12 +357,6 @@ namespace RPG.UI
 
         // ── Consumível / Misc ──────────────────────────────────────────────
 
-        /// <summary>
-        /// Reaproveita o consumable section para mostrar info de stack
-        /// também em itens Misc (já que ambos são stackable). Para
-        /// Consumable mostra HP/MP/duração + tamanho do stack; para Misc
-        /// mostra só o tamanho do stack.
-        /// </summary>
         private void ShowConsumableOrMiscSection(ItemData item)
         {
             if (_consumableSection == null) return;
@@ -375,7 +375,6 @@ namespace RPG.UI
                 showSection = _sharedSB.Length > 0;
             }
 
-            // Info de stack — tanto para Consumable quanto Misc
             if (item.IsStackable)
             {
                 if (_sharedSB.Length > 0) _sharedSB.AppendLine();

@@ -124,18 +124,22 @@ namespace RPG.Managers
     /// <summary>
     /// Persistência em SQLite. Compila integralmente apenas em UNITY_SERVER.
     ///
-    /// === MUDANÇAS DESTA VERSÃO ===
+    /// === MUDANÇAS DESTA VERSÃO (sem perda em shutdown) ===
     ///
-    ///   1. CÓDIGO MORTO REMOVIDO EM DrainQueue:
-    ///      A variável 'processed' era incrementada e zerada mas o loop não
-    ///      tinha yield/sleep, então o "burst protection" não tinha efeito
-    ///      algum. Removida — DrainQueue agora é um while simples e direto.
-    ///      A documentação anterior prometia comportamento que o código
-    ///      não tinha. Agora ambos estão alinhados.
+    ///   1. DRAIN GARANTIDO ANTES DE FECHAR:
+    ///      A versão anterior, em FlushAndClose, setava _closed=true ANTES
+    ///      do thread terminar. Como EnqueueWrite checa _closed e descarta
+    ///      escritas se true, havia uma janela onde escritas eram silenciosamente
+    ///      perdidas durante o shutdown. Agora:
+    ///        a. Sinalizamos shutdown sem bloquear novos enqueues.
+    ///        b. Aguardamos o thread terminar (que drena tudo, incluindo
+    ///           o que foi enfileirado depois do sinal).
+    ///        c. SÓ ENTÃO marcamos _closed=true e bloqueamos novos enqueues.
+    ///        d. Drain final (defensivo) para qualquer race residual.
     ///
-    ///   2. VALIDAÇÃO DE HASH LENGTH EM TryCreateAccount:
-    ///      Hashes SHA256 hex têm exatamente 64 chars. Hash mais curto/longo
-    ///      indica cliente malformado ou ataque. Rejeitamos cedo.
+    ///   2. CONTADOR DE OPERAÇÕES PENDENTES:
+    ///      Adicionado _pendingWrites para diagnóstico em shutdown
+    ///      (loga se houver escritas pendentes ao fechar).
     /// </summary>
     public class DatabaseManager : MonoBehaviour
     {
@@ -152,12 +156,18 @@ namespace RPG.Managers
 #if UNITY_SERVER
         private SQLiteConnection                 _db;
         private readonly object                  _dbLock              = new object();
-        private bool                             _closed              = false;
+        // _closed só vira true DEPOIS que o thread drenou tudo e o banco fechou
+        private volatile bool                    _closed              = false;
+        // _shuttingDown é o sinal inicial — para de aceitar timer mas drena pendentes
+        private volatile bool                    _shuttingDown        = false;
         private readonly ConcurrentQueue<Action> _writeQueue          = new ConcurrentQueue<Action>();
         private Thread                           _writeThread;
         private volatile bool                    _writeThreadRunning;
         private readonly ManualResetEventSlim    _writeEvent          = new ManualResetEventSlim(false);
         private const int                        WRITE_THREAD_JOIN_MS = 5000;
+
+        // Diagnóstico
+        private int _pendingWrites; // Interlocked
 #endif
 
         private void Awake()
@@ -181,15 +191,37 @@ namespace RPG.Managers
         {
 #if UNITY_SERVER
             if (_closed) return;
-            _closed             = true;
+            if (_shuttingDown)
+            {
+                // Reentrante: já estamos no processo, deixa terminar
+                return;
+            }
+
+            _shuttingDown = true;
+
+            // 1. Sinaliza o thread para terminar APÓS drenar
             _writeThreadRunning = false;
             _writeEvent.Set();
 
-            _writeThread?.Join(WRITE_THREAD_JOIN_MS);
+            // 2. Aguarda o thread terminar (ele faz o drain final lá dentro)
+            bool joined = _writeThread != null && _writeThread.Join(WRITE_THREAD_JOIN_MS);
+            if (!joined)
+                Debug.LogError("[DatabaseManager] Write thread não terminou em " +
+                               $"{WRITE_THREAD_JOIN_MS}ms. Pode haver escritas perdidas!");
 
-            // Drenagem final caso o thread tenha sido forçado a parar
+            // 3. Drain final defensivo (caso o thread tenha sido forçado a parar
+            //    no meio do drain, ou se algo escapou entre o Set e o Join)
             DrainQueue();
 
+            int pending = _pendingWrites;
+            if (pending > 0)
+                Debug.LogWarning($"[DatabaseManager] Shutdown com {pending} escritas " +
+                                 "ainda registradas (pode indicar race condition na contagem).");
+
+            // 4. AGORA bloqueamos novos enqueues
+            _closed = true;
+
+            // 5. Fecha o banco
             lock (_dbLock) { _db?.Close(); _db = null; }
             Debug.Log("[DatabaseManager] Banco fechado.");
 #endif
@@ -253,6 +285,8 @@ namespace RPG.Managers
                 _writeEvent.Reset();
                 DrainQueue();
             }
+            // Drain final ao terminar — garante que itens enfileirados
+            // entre o sinal de shutdown e este ponto sejam processados
             DrainQueue();
         }
 
@@ -263,19 +297,33 @@ namespace RPG.Managers
         {
             while (_writeQueue.TryDequeue(out Action action))
             {
-                try   { action(); }
-                catch (Exception e) { Debug.LogError($"[DB] Write thread erro: {e.Message}"); }
+                try
+                {
+                    action();
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"[DB] Write thread erro: {e.Message}");
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _pendingWrites);
+                }
             }
         }
 
         private void EnqueueWrite(Action writeAction)
         {
             if (writeAction == null) return;
+
+            // Após FlushAndClose ter terminado, recusa novos enqueues
             if (_closed)
             {
                 Debug.LogWarning("[DB] EnqueueWrite ignorado — banco já fechado.");
                 return;
             }
+
+            Interlocked.Increment(ref _pendingWrites);
             _writeQueue.Enqueue(writeAction);
             _writeEvent.Set();
         }
@@ -347,7 +395,6 @@ namespace RPG.Managers
                 || string.IsNullOrWhiteSpace(sessionNonce))
                 return new LoginAttemptResult(null, 0);
 
-            // Validação de formato do hash
             if (clientSignedHash.Length != EXPECTED_HASH_LENGTH)
                 return new LoginAttemptResult(null, GetRandomLoginFailDelayMs());
 

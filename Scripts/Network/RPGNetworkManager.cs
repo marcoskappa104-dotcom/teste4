@@ -11,16 +11,19 @@ namespace RPG.Network
     /// <summary>
     /// NetworkManager especializado para o RPG.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (sistema de armas) ===
+    /// === MUDANÇAS DESTA VERSÃO ===
     ///
-    ///   1. PROJECTILE PREFABS POR WeaponType:
-    ///      Adicionado dicionário projectilePrefabs com lookup O(1).
-    ///      NetworkMonsterEntity consulta via GetProjectilePrefab(WeaponType)
-    ///      para spawnar projétil correto (arco → flecha, cajado → missile).
+    ///   1. RACE EM _spawnCoroutines.Remove ELIMINADA:
+    ///      Antes, tanto DoSpawnPlayer quanto OnServerDisconnect chamavam
+    ///      Remove(connId). Se um cliente desconectava no meio do spawn,
+    ///      havia double-remove (benigno) E o spawn podia tentar agir numa
+    ///      conexão zumbi. Agora:
+    ///        - OnServerDisconnect marca o connId como inválido via remoção
+    ///          imediata da coroutine + cancela.
+    ///        - DoSpawnPlayer faz checagens mais defensivas em cada yield e
+    ///          sai limpo se a coroutine foi cancelada externamente.
     ///
-    ///   2. PROJECTILE PREFABS AUTO-REGISTRADOS:
-    ///      Adicionados a spawnablePrefabs na inicialização (sem precisar
-    ///      adicionar manualmente em ambos os lugares).
+    ///   2. PROJECTILE PREFABS POR WeaponType (mantido).
     /// </summary>
     public class RPGNetworkManager : NetworkManager
     {
@@ -72,6 +75,12 @@ namespace RPG.Network
 
         private readonly Dictionary<int, PendingSpawn> _pendingSpawns   = new();
         private readonly Dictionary<int, Coroutine>    _spawnCoroutines = new();
+
+        // Tracking de connIds cancelados durante a coroutine de spawn — usado
+        // como sinal de "essa coroutine deve abortar". HashSet pequeno e limpo
+        // rapidamente.
+        private readonly HashSet<int> _cancelledSpawns = new();
+
         private Coroutine _cleanupCoroutine;
 
         private bool              _prefabsRegistered;
@@ -152,6 +161,7 @@ namespace RPG.Network
                 if (kv.Value != null) StopCoroutine(kv.Value);
             _spawnCoroutines.Clear();
             _pendingSpawns.Clear();
+            _cancelledSpawns.Clear();
 
             if (_cleanupCoroutine != null)
             {
@@ -177,6 +187,7 @@ namespace RPG.Network
                 if (kv.Value != null) StopCoroutine(kv.Value);
             _spawnCoroutines.Clear();
             _pendingSpawns.Clear();
+            _cancelledSpawns.Clear();
 
             _prefabsRegistered = false;
             BuildProjectileLookup();
@@ -195,12 +206,17 @@ namespace RPG.Network
 
         public override void OnServerDisconnect(NetworkConnectionToClient conn)
         {
-            _pendingSpawns.Remove(conn.connectionId);
+            int connId = conn.connectionId;
 
-            if (_spawnCoroutines.TryGetValue(conn.connectionId, out var coroutine))
+            _pendingSpawns.Remove(connId);
+
+            // Marca a coroutine como cancelada ANTES de stop, para que se ela
+            // estiver no meio de um yield, o próximo check feche cedo.
+            if (_spawnCoroutines.TryGetValue(connId, out var coroutine))
             {
+                _cancelledSpawns.Add(connId);
                 if (coroutine != null) StopCoroutine(coroutine);
-                _spawnCoroutines.Remove(conn.connectionId);
+                _spawnCoroutines.Remove(connId);
             }
 
             _authManager?.OnServerDisconnect(conn);
@@ -266,6 +282,9 @@ namespace RPG.Network
 
             _pendingSpawns.Remove(conn.connectionId);
 
+            // Garante que connId não está na lista de cancelados (sanity)
+            _cancelledSpawns.Remove(conn.connectionId);
+
             var coroutine = StartCoroutine(DoSpawnPlayer(conn, pending.CharData, pending.AccountUsername));
             _spawnCoroutines[conn.connectionId] = coroutine;
         }
@@ -280,7 +299,7 @@ namespace RPG.Network
 
             if (conn == null || !conn.isReady)
             {
-                _spawnCoroutines.Remove(connId);
+                ClearSpawnTracking(connId);
                 yield break;
             }
 
@@ -289,6 +308,15 @@ namespace RPG.Network
             float elapsed = 0f;
             while (elapsed < SPAWN_NAVMESH_TIMEOUT)
             {
+                // Checagem a cada yield: se OnServerDisconnect marcou cancelado,
+                // sai sem fazer nada
+                if (_cancelledSpawns.Contains(connId))
+                {
+                    _cancelledSpawns.Remove(connId);
+                    ClearSpawnTracking(connId);
+                    yield break;
+                }
+
                 if (NavMesh.SamplePosition(spawnPos, out NavMeshHit hit, SPAWN_NAVMESH_RADIUS, NavMesh.AllAreas))
                 {
                     spawnPos = hit.position;
@@ -298,9 +326,14 @@ namespace RPG.Network
                 yield return null;
             }
 
-            if (conn == null || !conn.isReady || !NetworkServer.active)
+            // Validações finais antes de tocar o NetworkServer
+            if (_cancelledSpawns.Contains(connId)
+                || conn == null
+                || !conn.isReady
+                || !NetworkServer.active)
             {
-                _spawnCoroutines.Remove(connId);
+                _cancelledSpawns.Remove(connId);
+                ClearSpawnTracking(connId);
                 yield break;
             }
 
@@ -313,9 +346,16 @@ namespace RPG.Network
             else
                 Debug.LogError("[RPGNetworkManager] playerPrefab não tem NetworkPlayer.");
 
-            _spawnCoroutines.Remove(connId);
+            ClearSpawnTracking(connId);
 
             Debug.Log($"[Server] Spawnado: {charData.CharacterName} ({charData.Race}) | connId={connId}");
+        }
+
+        [Server]
+        private void ClearSpawnTracking(int connId)
+        {
+            if (connId < 0) return;
+            _spawnCoroutines.Remove(connId);
         }
 
         [Server]
@@ -366,7 +406,6 @@ namespace RPG.Network
             int registered = 0;
             int skipped    = 0;
 
-            // Prefabs de monstros/itens da lista principal
             foreach (var prefab in spawnablePrefabs)
             {
                 if (prefab == null) { skipped++; continue; }
@@ -374,8 +413,6 @@ namespace RPG.Network
                 registered++;
             }
 
-            // Prefabs de projéteis (auto-registro — usuário não precisa
-            // duplicar entradas nas duas listas)
             foreach (var entry in projectilePrefabs)
             {
                 if (entry?.ProjectilePrefab == null) continue;
@@ -404,7 +441,7 @@ namespace RPG.Network
                 NetworkClient.RegisterPrefab(prefab);
                 return true;
             }
-            return false; // já estava registrado
+            return false;
         }
     }
 }

@@ -40,21 +40,17 @@ namespace RPG.Managers
     /// Para um projeto pessoal ou alfa fechado isso é aceitável. Para release
     /// público, troque para bcrypt antes de aceitar contas reais.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (correções) ===
+    /// === MUDANÇAS DESTA VERSÃO ===
     ///
-    ///   1. CONSISTÊNCIA DA IMPLEMENTAÇÃO DE SHA256:
-    ///      A documentação afirmava que ComputeSHA256 usava HashData (.NET 6+)
-    ///      mas o código real criava uma instância SHA256 via Create(). Agora
-    ///      a implementação realmente usa SHA256.HashData (zero alocação,
-    ///      ~30% mais rápido) com fallback documentado para compatibilidade.
+    ///   1. COMENTÁRIO DO ComputeSHA256 ALINHADO COM A IMPLEMENTAÇÃO:
+    ///      Versão anterior do comentário mencionava SHA256.HashData (.NET 6+,
+    ///      não disponível em Unity 2022.3.62f3). A implementação usa
+    ///      SHA256.Create() + ComputeHash, que funciona em todas as versões
+    ///      do Mono/.NET Standard 2.1 suportadas pela Unity. Docs corrigidas.
     ///
-    ///   2. HashPassword REJEITA WHITESPACE:
-    ///      Antes retornava "" só para string vazia; agora também whitespace puro.
-    ///
-    ///   3. CONSTANT-TIME COMPARE NO LOGIN:
-    ///      ValidateLoginWithNonce agora usa comparação de tempo constante
-    ///      (CryptographicOperations.FixedTimeEquals quando disponível).
-    ///      Mitiga timing attacks em comparação de hashes.
+    ///   2. CONSTANT-TIME COMPARE NO LOGIN (mantido):
+    ///      ValidateLoginWithNonce usa comparação byte-a-byte que sempre
+    ///      percorre o comprimento total, mitigando timing leaks.
     /// </summary>
     public class GameManager : MonoBehaviour
     {
@@ -183,18 +179,25 @@ namespace RPG.Managers
 
 #endif
 
-public static string ComputeSHA256(string input)
-{
-    if (string.IsNullOrEmpty(input))
-        return "";
+        /// <summary>
+        /// Calcula SHA-256 e retorna como string hexadecimal lowercase.
+        ///
+        /// Implementação compatível com Unity 2022.3.62f3 (Mono / .NET Standard 2.1):
+        /// usa SHA256.Create() + ComputeHash. Não usa SHA256.HashData (.NET 6+,
+        /// indisponível nesta versão da Unity).
+        /// </summary>
+        public static string ComputeSHA256(string input)
+        {
+            if (string.IsNullOrEmpty(input))
+                return "";
 
-    byte[] inputBytes = System.Text.Encoding.UTF8.GetBytes(input);
+            byte[] inputBytes = System.Text.Encoding.UTF8.GetBytes(input);
 
-    using var sha = System.Security.Cryptography.SHA256.Create();
-    byte[] hash = sha.ComputeHash(inputBytes);
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            byte[] hash = sha.ComputeHash(inputBytes);
 
-    return BytesToHexLower(hash);
-}
+            return BytesToHexLower(hash);
+        }
 
         /// <summary>
         /// Converte bytes em hex lowercase. Mais rápido que BitConverter

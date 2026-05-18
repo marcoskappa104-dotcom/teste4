@@ -11,19 +11,23 @@ namespace RPG.Network
     /// <summary>
     /// NetworkManager especializado para o RPG.
     ///
-    /// === MUDANÇAS DESTA VERSÃO ===
+    /// === MUDANÇAS DESTA VERSÃO (defesa contra crescimento descontrolado) ===
     ///
-    ///   1. RACE EM _spawnCoroutines.Remove ELIMINADA:
-    ///      Antes, tanto DoSpawnPlayer quanto OnServerDisconnect chamavam
-    ///      Remove(connId). Se um cliente desconectava no meio do spawn,
-    ///      havia double-remove (benigno) E o spawn podia tentar agir numa
-    ///      conexão zumbi. Agora:
-    ///        - OnServerDisconnect marca o connId como inválido via remoção
-    ///          imediata da coroutine + cancela.
-    ///        - DoSpawnPlayer faz checagens mais defensivas em cada yield e
-    ///          sai limpo se a coroutine foi cancelada externamente.
+    ///   1. CAP EM _cancelledSpawns:
+    ///      O HashSet era populado em OnServerDisconnect e drenado em
+    ///      DoSpawnPlayer, mas se uma coroutine fosse parada manualmente
+    ///      sem chegar ao check (improvável mas possível), o entry ficaria
+    ///      órfão. Agora aplicamos o mesmo padrão LRU defensivo de
+    ///      ServerAuthManager._ipBans:
+    ///        - Cap de MAX_TRACKED_CANCELLED = 1000 (mais que suficiente para
+    ///          servidores grandes; conexões reais raramente passam disso)
+    ///        - Quando atinge o cap, drena 50% das entradas mais antigas
+    ///          (basta limpar metade do set, já que são connIds órfãos sem
+    ///          uso prático)
     ///
-    ///   2. PROJECTILE PREFABS POR WeaponType (mantido).
+    ///   2. CLEANUP PERIÓDICO:
+    ///      Adicionado ao CleanExpiredPendingSpawns: drena _cancelledSpawns
+    ///      junto com pendings. Garantia adicional contra acúmulo.
     /// </summary>
     public class RPGNetworkManager : NetworkManager
     {
@@ -34,6 +38,11 @@ namespace RPG.Network
         private const float SPAWN_NAVMESH_TIMEOUT   = 5f;
         private const float PENDING_SPAWN_TIMEOUT   = 30f;
         private const float CLEANUP_PENDING_SPAWN_S = 5f;
+
+        // Cap defensivo para _cancelledSpawns. Em operação normal, esse set
+        // raramente tem mais que ~10 entradas (jogadores desconectando durante
+        // spawn). 1000 é folga generosa antes de drenar.
+        private const int MAX_TRACKED_CANCELLED = 1000;
 
         private static readonly Dictionary<CharacterRace, Vector3> RaceSpawnPoints = new()
         {
@@ -77,8 +86,7 @@ namespace RPG.Network
         private readonly Dictionary<int, Coroutine>    _spawnCoroutines = new();
 
         // Tracking de connIds cancelados durante a coroutine de spawn — usado
-        // como sinal de "essa coroutine deve abortar". HashSet pequeno e limpo
-        // rapidamente.
+        // como sinal de "essa coroutine deve abortar".
         private readonly HashSet<int> _cancelledSpawns = new();
 
         private Coroutine _cleanupCoroutine;
@@ -214,13 +222,43 @@ namespace RPG.Network
             // estiver no meio de um yield, o próximo check feche cedo.
             if (_spawnCoroutines.TryGetValue(connId, out var coroutine))
             {
-                _cancelledSpawns.Add(connId);
+                AddCancelledSpawn(connId);
                 if (coroutine != null) StopCoroutine(coroutine);
                 _spawnCoroutines.Remove(connId);
             }
 
             _authManager?.OnServerDisconnect(conn);
             base.OnServerDisconnect(conn);
+        }
+
+        /// <summary>
+        /// Adiciona connId ao set de cancelados, drenando entradas antigas
+        /// se atingir o cap. Garante crescimento limitado mesmo em cenários
+        /// patológicos (botnet de conexões/desconexões).
+        /// </summary>
+        private void AddCancelledSpawn(int connId)
+        {
+            if (_cancelledSpawns.Count >= MAX_TRACKED_CANCELLED)
+            {
+                // Drena metade — não importa qual metade porque connIds órfãos
+                // não têm uso prático além de serem checados pela coroutine.
+                int toRemove = _cancelledSpawns.Count / 2;
+                int removed  = 0;
+                var enumerator = _cancelledSpawns.GetEnumerator();
+                var toRemoveList = new List<int>(toRemove);
+                while (enumerator.MoveNext() && removed < toRemove)
+                {
+                    toRemoveList.Add(enumerator.Current);
+                    removed++;
+                }
+                foreach (var id in toRemoveList)
+                    _cancelledSpawns.Remove(id);
+
+                Debug.LogWarning($"[RPGNetworkManager] _cancelledSpawns atingiu cap " +
+                                 $"({MAX_TRACKED_CANCELLED}). Drenadas {removed} entradas antigas.");
+            }
+
+            _cancelledSpawns.Add(connId);
         }
 
         public override void OnServerAddPlayer(NetworkConnectionToClient conn) { }
@@ -368,6 +406,7 @@ namespace RPG.Network
             {
                 yield return wait;
 
+                // Limpa pendingSpawns expirados
                 toRemove.Clear();
                 foreach (var kv in _pendingSpawns)
                 {
@@ -376,6 +415,24 @@ namespace RPG.Network
                 }
                 foreach (var id in toRemove)
                     _pendingSpawns.Remove(id);
+
+                // Cleanup defensivo de _cancelledSpawns: se algum connId ficou
+                // órfão (sem coroutine ativa nem pending), pode ser removido.
+                // Isso elimina memory leaks no canto improvável.
+                if (_cancelledSpawns.Count > 0)
+                {
+                    toRemove.Clear();
+                    foreach (var connId in _cancelledSpawns)
+                    {
+                        if (!_spawnCoroutines.ContainsKey(connId)
+                            && !_pendingSpawns.ContainsKey(connId))
+                        {
+                            toRemove.Add(connId);
+                        }
+                    }
+                    foreach (var id in toRemove)
+                        _cancelledSpawns.Remove(id);
+                }
             }
         }
 

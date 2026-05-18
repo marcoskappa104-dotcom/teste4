@@ -15,20 +15,23 @@ namespace RPG.Network
     /// <summary>
     /// Monstro com IA e combate server-authoritative.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (correção de XP indevido) ===
+    /// === MUDANÇAS DESTA VERSÃO (perf em cenas com muitos monstros) ===
     ///
-    ///   1. DAMAGE LOG SÓ NA APLICAÇÃO DE DANO:
-    ///      Antes, CmdBasicAttack ranged adicionava ao _damageLog ANTES do
-    ///      projétil chegar. Se o projétil errasse por timeout ou se o
-    ///      atacante morresse no caminho, o XP era distribuído para um
-    ///      dano que nunca foi aplicado.
-    ///      Agora:
-    ///        - Melee: damage log no impacto imediato (como antes).
-    ///        - Ranged: damage log em ServerTakeProjectileDamage, com o
-    ///          shooter netId fornecido pelo Projectile.
+    ///   1. CLEANUP DO DAMAGE LOG VIA COROUTINE:
+    ///      Antes: o Update fazia `if (Time.time - _lastDamageLogCleanupTime
+    ///      >= DAMAGE_LOG_CLEANUP_INTERVAL)` toda frame. Com 100 monstros em
+    ///      cena, são 100 checks por frame só para algo que roda a cada 60s.
+    ///      Agora: coroutine `DamageLogCleanupLoop` com WaitForSeconds —
+    ///      desliga 100% do custo entre cleanups.
     ///
-    ///   2. ASSINATURA DE ServerTakeProjectileDamage ESTENDIDA:
-    ///      Agora recebe shooterNetId para creditar o XP corretamente.
+    ///   2. BUFFER REUTILIZÁVEL EM CleanupOrphanedDamageEntries:
+    ///      Antes: alocava `new List<uint>()` em cada cleanup se houvesse
+    ///      órfãos. Agora usa `_damageLogCleanupBuffer` de instância.
+    ///      Zero alocação em estado estável.
+    ///
+    ///   3. MOVING UPDATE PERMANECE NO Update:
+    ///      Esse precisa rodar com frequência (10Hz) e o check é cheap.
+    ///      Não vale a pena coroutine para algo tão frequente.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -97,7 +100,7 @@ namespace RPG.Network
         // ── Constantes server-side ─────────────────────────────────────────
         private const float ATTACK_RANGE_TOLERANCE         = 1.15f;
         private const float CHASE_DEST_FRACTION            = 0.82f;
-        private const float SERVER_MAX_PLAYER_ATTACK_RANGE = 30f; // permite arco/cajado long range
+        private const float SERVER_MAX_PLAYER_ATTACK_RANGE = 30f;
         private const float REGEN_INTERVAL                 = 5f;
         private const float REGEN_PERCENT                  = 0.05f;
         private const float MOVING_UPDATE_INTERVAL         = 0.1f;
@@ -128,7 +131,9 @@ namespace RPG.Network
         // ── Estado interno ─────────────────────────────────────────────────
         private DerivedStats _stats;
         private readonly Dictionary<uint, float> _damageLog = new();
-        private float _lastDamageLogCleanupTime;
+
+        // Buffer reutilizável para cleanup de órfãos (zero alocação em estado estável)
+        private readonly List<uint> _damageLogCleanupBuffer = new(8);
 
         private float _kiteDistance;
 
@@ -152,6 +157,7 @@ namespace RPG.Network
         private WaitForSeconds _aggroScanWait;
         private WaitForSeconds _pathUpdateWait;
         private WaitForSeconds _regenWait;
+        private WaitForSeconds _damageLogCleanupWait;
 
         private Collider[] _aggroOverlapBuffer;
 
@@ -162,6 +168,7 @@ namespace RPG.Network
         private Coroutine _patrolWaitCoroutine;
         private Coroutine _regenCoroutine;
         private Coroutine _deathSequenceCoroutine;
+        private Coroutine _damageLogCleanupCoroutine;
 
         private bool _deathProcessed;
 
@@ -200,10 +207,11 @@ namespace RPG.Network
             if (_targetableLayerMask == 0)
                 Debug.LogWarning("[NetworkMonsterEntity] Layer 'Targetable' não encontrado.");
 
-            _aggroScanWait      = new WaitForSeconds(aggroScanInterval);
-            _pathUpdateWait     = new WaitForSeconds(pathUpdateRate);
-            _regenWait          = new WaitForSeconds(REGEN_INTERVAL);
-            _aggroOverlapBuffer = new Collider[AGGRO_OVERLAP_BUFFER_SIZE];
+            _aggroScanWait        = new WaitForSeconds(aggroScanInterval);
+            _pathUpdateWait       = new WaitForSeconds(pathUpdateRate);
+            _regenWait            = new WaitForSeconds(REGEN_INTERVAL);
+            _damageLogCleanupWait = new WaitForSeconds(DAMAGE_LOG_CLEANUP_INTERVAL);
+            _aggroOverlapBuffer   = new Collider[AGGRO_OVERLAP_BUFFER_SIZE];
         }
 
         public override void OnStartClient()
@@ -259,7 +267,6 @@ namespace RPG.Network
             _patrolWaiting     = false;
             _patrolTargetSet   = false;
             _damageLog.Clear();
-            _lastDamageLogCleanupTime = Time.time;
 
             _kiteDistance = attackRange * kiteDistanceFraction;
 
@@ -279,23 +286,25 @@ namespace RPG.Network
 
             CancelAllAICoroutines();
 
-            _aggroScanCoroutine  = StartCoroutine(AggroScanLoop());
-            _pathUpdateCoroutine = StartCoroutine(PathUpdateLoop());
+            _aggroScanCoroutine        = StartCoroutine(AggroScanLoop());
+            _pathUpdateCoroutine       = StartCoroutine(PathUpdateLoop());
+            _damageLogCleanupCoroutine = StartCoroutine(DamageLogCleanupLoop());
             RpcOnRespawned();
         }
 
         [Server]
         private void CancelAllAICoroutines()
         {
-            if (_aggroScanCoroutine     != null) { StopCoroutine(_aggroScanCoroutine);     _aggroScanCoroutine     = null; }
-            if (_pathUpdateCoroutine    != null) { StopCoroutine(_pathUpdateCoroutine);    _pathUpdateCoroutine    = null; }
-            if (_patrolWaitCoroutine    != null) { StopCoroutine(_patrolWaitCoroutine);    _patrolWaitCoroutine    = null; }
-            if (_regenCoroutine         != null) { StopCoroutine(_regenCoroutine);         _regenCoroutine         = null; }
-            if (_deathSequenceCoroutine != null) { StopCoroutine(_deathSequenceCoroutine); _deathSequenceCoroutine = null; }
+            if (_aggroScanCoroutine        != null) { StopCoroutine(_aggroScanCoroutine);        _aggroScanCoroutine        = null; }
+            if (_pathUpdateCoroutine       != null) { StopCoroutine(_pathUpdateCoroutine);       _pathUpdateCoroutine       = null; }
+            if (_patrolWaitCoroutine       != null) { StopCoroutine(_patrolWaitCoroutine);       _patrolWaitCoroutine       = null; }
+            if (_regenCoroutine            != null) { StopCoroutine(_regenCoroutine);            _regenCoroutine            = null; }
+            if (_deathSequenceCoroutine    != null) { StopCoroutine(_deathSequenceCoroutine);    _deathSequenceCoroutine    = null; }
+            if (_damageLogCleanupCoroutine != null) { StopCoroutine(_damageLogCleanupCoroutine); _damageLogCleanupCoroutine = null; }
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Update
+        // Update — agora SÓ checa moving state (cheap)
         // ══════════════════════════════════════════════════════════════════
 
         private void Update()
@@ -313,11 +322,8 @@ namespace RPG.Network
                 if (moving != _isMoving) _isMoving = moving;
             }
 
-            if (Time.time - _lastDamageLogCleanupTime >= DAMAGE_LOG_CLEANUP_INTERVAL)
-            {
-                _lastDamageLogCleanupTime = Time.time;
-                CleanupOrphanedDamageEntries();
-            }
+            // Cleanup do damage log foi movido para coroutine DamageLogCleanupLoop —
+            // não mais checado a cada frame.
 
             switch (_state)
             {
@@ -330,48 +336,6 @@ namespace RPG.Network
                 case AIState.Flee:       ServerFleeCheck();       break;
                 case AIState.ReturnHome: ServerReturnHomeCheck(); break;
             }
-        }
-
-        [Server]
-        private void CleanupOrphanedDamageEntries()
-        {
-            if (_damageLog.Count == 0) return;
-
-            List<uint> toRemove = null;
-            float maxDist = leashRange * 3f;
-
-            foreach (var kv in _damageLog)
-            {
-                bool orphaned = false;
-
-                if (!NetworkServer.spawned.TryGetValue(kv.Key, out var identity) || identity == null)
-                {
-                    orphaned = true;
-                }
-                else
-                {
-                    var np = identity.GetComponent<NetworkPlayer>();
-                    if (np == null)
-                    {
-                        orphaned = true;
-                    }
-                    else if (!np.Dead
-                             && Vector3.Distance(np.transform.position, transform.position) > maxDist)
-                    {
-                        orphaned = true;
-                    }
-                }
-
-                if (orphaned)
-                {
-                    if (toRemove == null) toRemove = new List<uint>();
-                    toRemove.Add(kv.Key);
-                }
-            }
-
-            if (toRemove != null)
-                foreach (var id in toRemove)
-                    _damageLog.Remove(id);
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -443,6 +407,63 @@ namespace RPG.Network
                 _currentHP = Mathf.Min(_maxHP, _currentHP + _maxHP * REGEN_PERCENT);
             }
             _regenCoroutine = null;
+        }
+
+        /// <summary>
+        /// Limpa entradas órfãs do _damageLog periodicamente.
+        /// Antes era checado a cada frame no Update — agora é coroutine
+        /// rodando a cada DAMAGE_LOG_CLEANUP_INTERVAL segundos, eliminando
+        /// 100% do custo entre cleanups.
+        /// </summary>
+        [Server]
+        private IEnumerator DamageLogCleanupLoop()
+        {
+            while (true)
+            {
+                yield return _damageLogCleanupWait;
+                if (this == null || !isServer) yield break;
+                if (_isDead) continue;
+                CleanupOrphanedDamageEntries();
+            }
+        }
+
+        [Server]
+        private void CleanupOrphanedDamageEntries()
+        {
+            if (_damageLog.Count == 0) return;
+
+            // Usa buffer de instância — zero alocação
+            _damageLogCleanupBuffer.Clear();
+            float maxDist = leashRange * 3f;
+
+            foreach (var kv in _damageLog)
+            {
+                bool orphaned = false;
+
+                if (!NetworkServer.spawned.TryGetValue(kv.Key, out var identity) || identity == null)
+                {
+                    orphaned = true;
+                }
+                else
+                {
+                    var np = identity.GetComponent<NetworkPlayer>();
+                    if (np == null)
+                    {
+                        orphaned = true;
+                    }
+                    else if (!np.Dead
+                             && Vector3.Distance(np.transform.position, transform.position) > maxDist)
+                    {
+                        orphaned = true;
+                    }
+                }
+
+                if (orphaned)
+                    _damageLogCleanupBuffer.Add(kv.Key);
+            }
+
+            for (int i = 0; i < _damageLogCleanupBuffer.Count; i++)
+                _damageLog.Remove(_damageLogCleanupBuffer[i]);
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -783,12 +804,6 @@ namespace RPG.Network
         // Recebimento de dano POR PROJÉTIL
         // ══════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Chamado pelo Projectile no impacto. Recebe shooterNetId para que o
-        /// XP seja creditado APENAS quando o dano é realmente aplicado
-        /// (não no momento do disparo). Isso evita XP indevido quando o
-        /// projétil erra por timeout ou alvo se move demais.
-        /// </summary>
         [Server]
         public void ServerTakeProjectileDamage(uint shooterNetId, float dmg, bool crit)
         {
@@ -799,8 +814,6 @@ namespace RPG.Network
 
             CreditDamageToShooter(shooterNetId, dmg);
 
-            // Aggro reaction: como o atacante atirou de longe, ainda assim
-            // queremos que o monstro reaja (perseguir/fugir/etc)
             var attacker = FindPlayerByNetId(shooterNetId);
             if (attacker != null && !attacker.Dead)
                 ApplyAggroReaction(attacker);
@@ -861,7 +874,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // CmdBasicAttack — damage log SÓ na aplicação
+        // CmdBasicAttack
         // ══════════════════════════════════════════════════════════════════
 
         [Command(requiresAuthority = false)]
@@ -881,11 +894,9 @@ namespace RPG.Network
             var atkStats = attacker.ServerStats;
             if (atkStats == null) return;
 
-            // === RESOLVE O PERFIL DE ARMA NO SERVIDOR ===
             var inventory = attacker.GetComponent<NetworkInventory>();
             WeaponAttackProfile profile = ResolveServerWeaponProfile(inventory);
 
-            // Anti-cheat: cliente não pode reportar range maior que o real do perfil.
             float serverRange = profile.Range;
             float effectiveRange = Mathf.Min(
                 Mathf.Clamp(clientAttackRange, 0.5f, SERVER_MAX_PLAYER_ATTACK_RANGE),
@@ -901,7 +912,6 @@ namespace RPG.Network
                 return;
             }
 
-            // Cooldown: 1/ASPD escalado pelo multiplier da arma
             long cooldownKey = BuildBasicAttackCooldownKey(attacker.netId, netId);
             float baseInterval = atkStats.ASPD > 0f ? (1f / atkStats.ASPD) : 1.2f;
             float attackInterval = Mathf.Clamp(
@@ -909,7 +919,6 @@ namespace RPG.Network
 
             if (!attacker.ServerCheckAndSetCooldownLong(cooldownKey, attackInterval)) return;
 
-            // Custo de mana (cajado/varinha)
             if (profile.ManaCost > 0f)
             {
                 if (attacker.CurrentMP < profile.ManaCost)
@@ -920,7 +929,6 @@ namespace RPG.Network
                 attacker.ServerConsumeMP(profile.ManaCost);
             }
 
-            // Roll de acerto
             bool hit = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
             if (!hit)
             {
@@ -928,7 +936,6 @@ namespace RPG.Network
                 return;
             }
 
-            // Calcula dano (físico ou mágico) com multiplicador da arma
             bool  crit = StatsCalculator.RollCrit(atkStats.CRIT);
             float dmg;
 
@@ -958,14 +965,10 @@ namespace RPG.Network
 
             if (profile.UsesProjectile)
             {
-                // RANGED: damage log será creditado em ServerTakeProjectileDamage
-                // quando o projétil REALMENTE impactar. Aggro reaction também
-                // acontece no impacto, dando feedback mais natural.
                 SpawnAttackProjectile(attacker, profile, dmg, crit);
             }
             else
             {
-                // MELEE: dano e crédito imediatos
                 CreditDamageToShooter(attacker.netId, dmg);
                 ApplyAggroReaction(attacker);
                 RpcShowDamage(dmg, crit, ImpactPoint);
@@ -973,10 +976,6 @@ namespace RPG.Network
             }
         }
 
-        /// <summary>
-        /// Lê o NetworkInventory do atacante e resolve o perfil de arma efetivo.
-        /// Server-side: cliente não pode injetar perfil falso.
-        /// </summary>
         [Server]
         private WeaponAttackProfile ResolveServerWeaponProfile(NetworkInventory inventory)
         {
@@ -994,10 +993,6 @@ namespace RPG.Network
             return item.GetEffectiveAttackProfile();
         }
 
-        /// <summary>
-        /// Spawna um projétil no servidor que vai impactar o monstro.
-        /// O projétil carrega o shooterNetId para creditar o dano no impacto.
-        /// </summary>
         [Server]
         private void SpawnAttackProjectile(NetworkPlayer attacker, WeaponAttackProfile profile,
                                            float damage, bool crit)
@@ -1014,7 +1009,6 @@ namespace RPG.Network
                 return;
             }
 
-            // Spawna na frente do atacante, ~altura do peito
             Vector3 spawnPos = attacker.transform.position
                              + attacker.transform.forward * 0.5f
                              + Vector3.up * 1.2f;
@@ -1027,7 +1021,6 @@ namespace RPG.Network
             {
                 Debug.LogError("[Combat] Projétil prefab não tem componente Projectile!");
                 Destroy(go);
-                // Fallback: aplica dano direto
                 CreditDamageToShooter(attacker.netId, damage);
                 ApplyAggroReaction(attacker);
                 RpcShowDamage(damage, crit, ImpactPoint);
@@ -1036,8 +1029,6 @@ namespace RPG.Network
             }
 
             NetworkServer.Spawn(go);
-            // Passa o netId do atacante para o projétil — usado no crédito
-            // de XP no momento do impacto.
             proj.ServerInitialize(this, attacker.netId, profile.ProjectileSpeed, damage, crit);
         }
 

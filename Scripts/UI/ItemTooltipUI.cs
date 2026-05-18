@@ -13,12 +13,15 @@ namespace RPG.UI
     ///
     /// === MUDANÇAS DESTA VERSÃO (perf em hover) ===
     ///
-    ///   1. USA NetworkPlayer.GetRaceEnum():
-    ///      Antes, TryGetLocalPlayerStats fazia Enum.TryParse<CharacterRace>
-    ///      em cada hover — string parsing aloca. Em hovers rápidos isso ia
-    ///      pro GC.
-    ///      Agora consulta GetRaceEnum() que retorna o cached _cachedRace
-    ///      do NetworkPlayer (atualizado quando RaceStr muda via SyncVar hook).
+    ///   1. BUFFERS Vector3[] REUTILIZÁVEIS:
+    ///      PositionByAnchor e ClampToScreen alocavam `Vector3[] corners =
+    ///      new Vector3[4]` a cada chamada. Em hovers rápidos (mouse passando
+    ///      por uma fileira de slots), isso enchia o GC. Agora usamos arrays
+    ///      de instância.
+    ///
+    ///   2. USA NetworkPlayer.GetRaceEnum():
+    ///      TryGetLocalPlayerStats já usava o cached _cachedRace (sem
+    ///      Enum.TryParse). Mantido — só estou comentando pra confirmar.
     /// </summary>
     public class ItemTooltipUI : MonoBehaviour
     {
@@ -57,6 +60,12 @@ namespace RPG.UI
         [SerializeField] private Vector2 _offset = new Vector2(20f, 0f);
 
         private readonly StringBuilder _sharedSB = new StringBuilder(256);
+
+        // Buffers reutilizáveis para PositionByAnchor / ClampToScreen.
+        // Antes alocava Vector3[4] em cada hover.
+        private readonly Vector3[] _anchorCorners = new Vector3[4];
+        private readonly Vector3[] _rootCorners   = new Vector3[4];
+        private readonly Vector3[] _canvasCorners = new Vector3[4];
 
         private void Awake()
         {
@@ -387,7 +396,7 @@ namespace RPG.UI
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Posicionamento
+        // Posicionamento — agora usando buffers de instância (zero alloc)
         // ══════════════════════════════════════════════════════════════════
 
         private void PositionByAnchor(RectTransform anchor)
@@ -401,10 +410,10 @@ namespace RPG.UI
             Canvas canvas = _root.GetComponentInParent<Canvas>();
             if (canvas == null) return;
 
-            Vector3[] corners = new Vector3[4];
-            anchor.GetWorldCorners(corners);
+            // Usa buffer de instância em vez de alocar new Vector3[4]
+            anchor.GetWorldCorners(_anchorCorners);
 
-            Vector3 worldPos = corners[2];
+            Vector3 worldPos = _anchorCorners[2];
             worldPos += new Vector3(_offset.x, _offset.y, 0f) * canvas.scaleFactor / 100f;
             _root.position = worldPos;
 
@@ -444,20 +453,19 @@ namespace RPG.UI
         {
             if (_root == null || canvas == null) return;
 
-            Vector3[] corners = new Vector3[4];
-            _root.GetWorldCorners(corners);
+            // Usa buffers de instância em vez de alocar new Vector3[4] (×2)
+            _root.GetWorldCorners(_rootCorners);
 
             var canvasRect = canvas.transform as RectTransform;
             if (canvasRect == null) return;
 
-            Vector3[] canvasCorners = new Vector3[4];
-            canvasRect.GetWorldCorners(canvasCorners);
+            canvasRect.GetWorldCorners(_canvasCorners);
 
             float dx = 0f, dy = 0f;
-            if (corners[2].x > canvasCorners[2].x) dx = canvasCorners[2].x - corners[2].x;
-            if (corners[0].x < canvasCorners[0].x) dx = canvasCorners[0].x - corners[0].x;
-            if (corners[1].y > canvasCorners[1].y) dy = canvasCorners[1].y - corners[1].y;
-            if (corners[0].y < canvasCorners[0].y) dy = canvasCorners[0].y - corners[0].y;
+            if (_rootCorners[2].x > _canvasCorners[2].x) dx = _canvasCorners[2].x - _rootCorners[2].x;
+            if (_rootCorners[0].x < _canvasCorners[0].x) dx = _canvasCorners[0].x - _rootCorners[0].x;
+            if (_rootCorners[1].y > _canvasCorners[1].y) dy = _canvasCorners[1].y - _rootCorners[1].y;
+            if (_rootCorners[0].y < _canvasCorners[0].y) dy = _canvasCorners[0].y - _rootCorners[0].y;
 
             if (dx != 0f || dy != 0f)
                 _root.position += new Vector3(dx, dy, 0f);

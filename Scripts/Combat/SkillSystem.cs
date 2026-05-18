@@ -31,28 +31,22 @@ namespace RPG.Combat
     /// <summary>
     /// Gerencia a barra de skills do jogador local.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (correções e clareza) ===
+    /// === MUDANÇAS DESTA VERSÃO (UX em walk-to-skill) ===
     ///
-    ///   1. DOCUMENTAÇÃO CORRIGIDA:
-    ///      O comentário antigo mencionava um flag "_walkCleanupDone" que
-    ///      não existe. O cleanup do walk é feito por código SEQUENCIAL após
-    ///      o loop while — não há flag de proteção. Removida menção enganosa.
+    ///   1. TIMEOUT REDUZIDO DE 15s PARA 8s:
+    ///      15s era muito tempo para o jogador descobrir que não conseguia
+    ///      alcançar o alvo (NavMesh quebrado, alvo em ilha, ravina entre).
+    ///      8s ainda dá folga para perseguições legítimas em mapas grandes
+    ///      mas falha rapidamente quando o caminho é impossível.
     ///
-    ///   2. EVENTOS DE PlayerEntity ENCANANDO CANCELAMENTO:
-    ///      Inscreve-se em OnDeathChanged e OnTargetChanged. Eventos cancelam
-    ///      walk/cast imediatamente — sem depender da checagem reativa no Update.
+    ///   2. MENSAGEM AO USUÁRIO EM TIMEOUT:
+    ///      Antes, o timeout só logava em debug. Agora mostramos uma
+    ///      UIManager.ShowMessage para o jogador entender que a skill
+    ///      foi cancelada e não está bugada.
     ///
-    ///   3. CLEANUP COMPLETO EM OnDisable / OnDestroy:
-    ///      Desinscreve dos eventos do PlayerEntity também (não só do inventário).
-    ///
-    ///   4. CAST CANCELADO EM ChangeOfTarget:
-    ///      Se o player trocar de alvo durante um cast em outro alvo, o cast
-    ///      é cancelado (não dispara skill no alvo errado quando termina).
-    ///
-    ///   5. RE-VALIDAÇÃO EM RANGE NO FIM DO WALK:
-    ///      Após o walk terminar com sucesso, validamos novamente todas as
-    ///      pré-condições antes de iniciar o cast (player vivo, alvo válido,
-    ///      target ainda é o pretendido).
+    ///   3. WALK_TIMEOUT MOVIDO PARA CONSTANTE NO TOPO:
+    ///      Facilita ajuste futuro (e o jogador pode personalizar via
+    ///      GameConstants.Client.WALK_TO_RANGE_TIMEOUT que já existe lá).
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     public class SkillSystem : NetworkBehaviour
@@ -62,7 +56,12 @@ namespace RPG.Combat
 
         public  const int   MAX_SKILLS              = 4;
         private const float CMD_MOVE_INTERVAL       = 0.18f;
-        private const float WALK_TIMEOUT            = 15f;
+
+        // Reduzido de 15s para 8s. Caminhar mais que isso significa que o alvo
+        // é inalcançável (ilha, ravina, NavMesh quebrado). Damos feedback rápido
+        // em vez de deixar o jogador esperando.
+        private const float WALK_TIMEOUT            = 8f;
+
         private const float WALK_DEST_FRACTION      = 0.85f;
         private const float RANGE_CHECK_MARGIN      = 1.05f;
         private const float WALK_STOP_DIST          = 0.15f;
@@ -448,6 +447,7 @@ namespace RPG.Combat
             float timeout        = WALK_TIMEOUT;
             float effectiveRange = skill.Range * RANGE_CHECK_MARGIN;
             bool  reachedRange   = false;
+            bool  timedOut       = false;
 
             // Loop principal — sai por timeout, morte, alvo inválido, alvo mudou,
             // ou alvo entrou em range.
@@ -503,6 +503,9 @@ namespace RPG.Combat
                 yield return null;
             }
 
+            if (timeout <= 0f && !reachedRange)
+                timedOut = true;
+
             // ── CLEANUP UNIFICADO ──────────────────────────────────────────
             // Roda incondicionalmente após o loop, independente do motivo de saída.
             _walkCoroutine  = null;
@@ -517,8 +520,6 @@ namespace RPG.Combat
                 yield return null;
 
                 // Re-valida TODAS as pré-condições antes de executar a skill.
-                // O frame de respiro acima abre uma janela onde algo pode ter
-                // mudado (player morreu, alvo morreu, target trocou).
                 if (!_player.IsDead && IsTargetValid(target) && _player.CurrentTarget == target)
                 {
                     Log($"Em range. Executando skill {index}.");
@@ -535,8 +536,14 @@ namespace RPG.Combat
                 // o player caminhando indefinidamente.
                 StopAgent();
 
-                if (timeout <= 0f)
-                    Log($"Walk: timeout após {WALK_TIMEOUT}s.");
+                // Feedback explícito ao jogador em caso de timeout. Caminhos
+                // impossíveis (ilha, ravina) agora dão erro em 8s em vez de 15.
+                if (timedOut)
+                {
+                    UIManager.Instance?.ShowMessage(
+                        $"Não foi possível alcançar o alvo para usar {skill.Name}.");
+                    Log($"Walk: timeout após {WALK_TIMEOUT}s — alvo inalcançável.");
+                }
             }
         }
 

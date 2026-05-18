@@ -24,20 +24,22 @@ namespace RPG.Combat
     /// === REATIVIDADE ===
     ///   - Inscreve-se em OnEquipmentChanged. Trocar de arma durante auto-ataque
     ///     atualiza o perfil ativo em tempo real.
+    ///   - Inscreve-se em OnStatsChanged para recalcular o intervalo quando ASPD
+    ///     muda (alocação de pontos, equipamento, buff).
     ///
-    /// === MUDANÇAS DESTA VERSÃO (correção real) ===
+    /// === MUDANÇAS DESTA VERSÃO (perf) ===
     ///
-    ///   1. TROCA DE ARMA FORÇA REDIRECT NO PRÓXIMO TICK:
-    ///      A versão anterior detectava troca de arma com range menor mas
-    ///      apenas logava — o loop principal podia não recalcular o destino
-    ///      porque _lastChaseDestination ainda era considerado válido.
-    ///      Agora invalidamos _lastChaseDestination para forçar SetDestination
-    ///      no próximo UpdateAutoAttack, garantindo que o player se reposicione.
+    ///   1. CACHE DE _cachedAttackInterval:
+    ///      GetAttackInterval era chamado a cada frame durante combate. Cada
+    ///      chamada lia _player.Stats.ASPD, fazia divisão, Mathf.Max e Clamp.
+    ///      Trivial individualmente mas com 50 players em combate = 50 cálculos
+    ///      idênticos por frame. Agora cacheamos e invalidamos via:
+    ///        - Troca de arma (OnEquipmentChanged já existente)
+    ///        - Mudança de stats (OnStatsChanged, nova subscrição)
+    ///        - Player inicializa (OnInitialized, nova subscrição)
     ///
-    ///   2. RESET DE _attackTimer EM TROCA DE ARMA:
-    ///      Se a nova arma é muito mais lenta/rápida, o timer acumulado da
-    ///      arma antiga não fazia sentido. Resetar dá comportamento previsível
-    ///      (próximo ataque respeita o intervalo da nova arma).
+    ///   2. UNSUBSCRIBE DE OnStatsChanged / OnInitialized:
+    ///      Adicionado ao cleanup junto com as outras subscrições do PlayerEntity.
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -64,6 +66,7 @@ namespace RPG.Combat
         private const float MIN_INTERVAL       = 0.2f;
         private const float MAX_INTERVAL       = 3f;
         private const float ROTATION_SPEED     = 12f;
+        private const float DEFAULT_INTERVAL   = 1.2f;
 
         // ── Componentes ────────────────────────────────────────────────────
         private PlayerEntity            _player;
@@ -86,6 +89,11 @@ namespace RPG.Combat
 
         // Perfil da arma em uso. Cacheado e refeito quando o inventário muda.
         private WeaponAttackProfile _currentProfile;
+
+        // Cache do intervalo de ataque (perf). Invalidado em troca de arma,
+        // mudança de stats, ou troca de player. Recalculado no próximo acesso.
+        private float _cachedAttackInterval = DEFAULT_INTERVAL;
+        private bool  _attackIntervalDirty  = true;
 
         // ── Subscrições para cleanup ───────────────────────────────────────
         private bool _subscribedToPlayerEvents;
@@ -115,6 +123,7 @@ namespace RPG.Combat
             SubscribeToPlayerEvents();
             SubscribeToInventoryEvents();
             RefreshWeaponProfile();
+            InvalidateAttackIntervalCache();
         }
 
         public override void OnStopClient()
@@ -141,6 +150,8 @@ namespace RPG.Combat
 
             _player.OnDeathChanged  += OnPlayerDeathChanged;
             _player.OnTargetChanged += OnPlayerTargetChanged;
+            _player.OnStatsChanged  += OnPlayerStatsChanged;
+            _player.OnInitialized   += OnPlayerInitialized;
 
             _subscribedToPlayerEvents = true;
         }
@@ -151,6 +162,8 @@ namespace RPG.Combat
 
             _player.OnDeathChanged  -= OnPlayerDeathChanged;
             _player.OnTargetChanged -= OnPlayerTargetChanged;
+            _player.OnStatsChanged  -= OnPlayerStatsChanged;
+            _player.OnInitialized   -= OnPlayerInitialized;
 
             _subscribedToPlayerEvents = false;
         }
@@ -184,10 +197,25 @@ namespace RPG.Combat
                 CancelAutoAttackSoft();
         }
 
+        private void OnPlayerStatsChanged()
+        {
+            // ASPD pode ter mudado → invalida cache
+            InvalidateAttackIntervalCache();
+        }
+
+        private void OnPlayerInitialized()
+        {
+            // Stats apareceram pela primeira vez
+            InvalidateAttackIntervalCache();
+        }
+
         private void OnEquipmentChanged()
         {
             var oldProfile = _currentProfile;
             RefreshWeaponProfile();
+
+            // Troca de arma também invalida o intervalo (multiplier muda)
+            InvalidateAttackIntervalCache();
 
             // Se trocou de arma durante auto-ataque, forçamos o loop a recalcular
             // tudo: distância, destino, timing. Sem isso, _lastChaseDestination
@@ -206,6 +234,11 @@ namespace RPG.Combat
                         Log($"Troca de arma → ainda em range.");
                 }
             }
+        }
+
+        private void InvalidateAttackIntervalCache()
+        {
+            _attackIntervalDirty = true;
         }
 
         /// <summary>
@@ -297,6 +330,7 @@ namespace RPG.Combat
         {
             // Garante que temos o perfil mais atual da arma equipada
             RefreshWeaponProfile();
+            InvalidateAttackIntervalCache();
 
             _skillSystem?.CancelPendingWalkSoft();
             CancelAutoAttackSoft();
@@ -432,14 +466,23 @@ namespace RPG.Combat
 
         // ── Helpers ────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Retorna o intervalo entre ataques em segundos. Cacheado — só
+        /// recalcula quando _attackIntervalDirty for setado (troca de arma,
+        /// mudança de stats, inicialização).
+        /// </summary>
         private float GetAttackInterval()
         {
-            float baseInterval = 1.2f;
-            if (_player.IsInitialized && _player.Stats != null)
+            if (!_attackIntervalDirty) return _cachedAttackInterval;
+
+            float baseInterval = DEFAULT_INTERVAL;
+            if (_player != null && _player.IsInitialized && _player.Stats != null)
                 baseInterval = 1f / Mathf.Max(0.1f, _player.Stats.ASPD);
 
             float modifier = _currentProfile?.AttackIntervalMultiplier ?? 1f;
-            return Mathf.Clamp(baseInterval * modifier, MIN_INTERVAL, MAX_INTERVAL);
+            _cachedAttackInterval = Mathf.Clamp(baseInterval * modifier, MIN_INTERVAL, MAX_INTERVAL);
+            _attackIntervalDirty  = false;
+            return _cachedAttackInterval;
         }
 
         private void StopAgentMovement()

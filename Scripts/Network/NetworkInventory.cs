@@ -13,24 +13,23 @@ namespace RPG.Network
     /// <summary>
     /// Inventário do jogador. Server-authoritative.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (segurança em swap) ===
+    /// === MUDANÇAS DESTA VERSÃO (UX em pickup parcial) ===
     ///
-    ///   1. ROLLBACK SEGURO EM TrySwapFromInventory:
-    ///      A versão anterior, em caso de falha CRÍTICA de rollback, fazia
-    ///      Slots.Add direto bypassando ServerAddItem. Isso era uma porta
-    ///      para duplicação de itens se o ItemDatabase estivesse corrompido.
-    ///      Agora preferimos PERDER o item (raríssimo) a duplicá-lo. Log
-    ///      crítico permanece para análise do operador.
+    ///   1. EVENTO OnPartialPickup (cliente):
+    ///      AddStackable já tinha o comportamento correto (aceita parcial em vez
+    ///      de rollback total — melhor que perder farm), mas o jogador só era
+    ///      informado via mensagem flutuante de texto. UIs que queiram reagir
+    ///      ao evento (mostrar warning persistente, destacar slot que ficou
+    ///      cheio, etc) agora podem escutar OnPartialPickup.
     ///
-    ///   2. MENSAGEM CLARA QUANDO ItemDatabase INDISPONÍVEL:
-    ///      Antes, se ItemDatabase.Instance fosse null, o jogador recebia
-    ///      "Este item não pode ser equipado" — confuso. Agora diferencia
-    ///      "banco de itens não disponível" de "item inválido para slot".
+    ///   2. NOVO RPC RpcOnPartialPickupOwner:
+    ///      Server dispara para o owner quando há pickup parcial. UI cliente
+    ///      pode escutar via InventoryUI.OnPartialPickup.
     ///
-    ///   3. EARLY-RETURN EM Cmds SE INVENTÁRIO NÃO INICIALIZADO:
-    ///      Adicionado check de _netPlayer != null já existia; agora também
-    ///      validamos que ItemDatabase.Instance existe (ele é singleton mas
-    ///      pode não estar pronto no primeiro frame após carga de cena).
+    ///   3. SEMÂNTICA PRESERVADA:
+    ///      O comportamento de aceitar parcial e mostrar mensagem permanece
+    ///      idêntico — apenas adicionamos o canal de evento. Código existente
+    ///      que não escuta o evento continua funcionando.
     /// </summary>
     [RequireComponent(typeof(NetworkIdentity))]
     public class NetworkInventory : NetworkBehaviour
@@ -51,6 +50,13 @@ namespace RPG.Network
         public event Action OnInventoryChanged;
         public event Action OnGemLoadoutChanged;
         public event Action OnEquipmentChanged;
+
+        /// <summary>
+        /// Disparado no OWNER quando um pickup foi parcialmente aceito por
+        /// inventário cheio. Args: (itemId, collected, requested).
+        /// UI pode reagir mostrando warning persistente além da floating message.
+        /// </summary>
+        public event Action<string, int, int> OnPartialPickup;
 
         // ── Estado do servidor ─────────────────────────────────────────────
         private int           _nextSlotIndex;
@@ -136,12 +142,18 @@ namespace RPG.Network
         private int AddNonStackable(ItemData item, int quantity)
         {
             int firstAffected = -1;
+            int added         = 0;
 
             for (int i = 0; i < quantity; i++)
             {
                 if (Slots.Count >= MAX_INVENTORY_SLOTS)
                 {
                     _netPlayer?.RpcShowMessageToOwner("Inventário cheio!");
+
+                    // Pickup parcial — dispara evento de feedback
+                    if (added > 0 && added < quantity && _netPlayer != null)
+                        RpcNotifyPartialPickup(item.ItemId, added, quantity);
+
                     return firstAffected;
                 }
 
@@ -152,6 +164,7 @@ namespace RPG.Network
                     Quantity  = 1
                 };
                 Slots.Add(slot);
+                added++;
 
                 if (firstAffected < 0) firstAffected = slot.SlotIndex;
             }
@@ -165,12 +178,13 @@ namespace RPG.Network
         ///   2. Cria novos slots para o restante.
         ///   3. Se inventário lota no meio, ACEITA PARCIAL e avisa o jogador
         ///      (é melhor UX que rollback total — perder farm é frustrante).
+        ///      Adicionalmente, dispara OnPartialPickup via RPC para UI reagir.
         /// </summary>
         [Server]
         private int AddStackable(ItemData item, int quantity)
         {
-            int maxStack     = item.EffectiveMaxStack;
-            int remaining    = quantity;
+            int maxStack      = item.EffectiveMaxStack;
+            int remaining     = quantity;
             int firstAffected = -1;
 
             // Fase 1: topar stacks existentes
@@ -196,8 +210,14 @@ namespace RPG.Network
             {
                 if (Slots.Count >= MAX_INVENTORY_SLOTS)
                 {
+                    int collected = quantity - remaining;
                     _netPlayer?.RpcShowMessageToOwner(
-                        $"Inventário cheio! Coletou {quantity - remaining}/{quantity} {item.DisplayName}.");
+                        $"Inventário cheio! Coletou {collected}/{quantity} {item.DisplayName}.");
+
+                    // Pickup parcial — dispara evento se algo foi coletado
+                    if (collected > 0 && _netPlayer != null)
+                        RpcNotifyPartialPickup(item.ItemId, collected, quantity);
+
                     return firstAffected;
                 }
 
@@ -217,6 +237,14 @@ namespace RPG.Network
             }
 
             return firstAffected;
+        }
+
+        [TargetRpc]
+        private void RpcNotifyPartialPickup(string itemId, int collected, int requested)
+        {
+            // Hook para UI no owner. UIs que escutam OnPartialPickup recebem
+            // o evento; quem não escuta, ignora silenciosamente.
+            OnPartialPickup?.Invoke(itemId, collected, requested);
         }
 
         [Server]

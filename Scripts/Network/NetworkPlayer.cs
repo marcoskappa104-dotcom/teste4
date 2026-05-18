@@ -15,27 +15,27 @@ namespace RPG.Network
     /// <summary>
     /// Representação server-authoritative de um jogador no mundo.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (correções e polimento) ===
+    /// === MUDANÇAS DESTA VERSÃO (correções de revisão) ===
     ///
-    ///   1. ORDEM DE SyncVar HOOK PROTEGIDA (HP/MaxHP):
-    ///      Em raros casos a SyncVar de CurrentHP chega antes de MaxHP no
-    ///      mesmo batch — o slider podia exibir maxValue < value brevemente.
-    ///      Agora OnNetHPChanged usa Math.Max(MaxHP, newHP) para o slider.
+    ///   1. BUG CORRIGIDO EM OnNetMaxHPChanged:
+    ///      A versão anterior tinha duas atribuições sequenciais a maxValue:
+    ///        _hpBarSlider.maxValue = Mathf.Max(newMax, _hpBarSlider.value);
+    ///        _hpBarSlider.maxValue = newMax;  // ← sobrescrevia a defesa acima
+    ///      A primeira linha existia para evitar o caso em que CurrentHP chegou
+    ///      antes de MaxHP (maxValue < value, slider quebrado). A segunda linha
+    ///      apagava essa defesa imediatamente. Agora setamos uma vez só, com
+    ///      a defesa preservada.
     ///
-    ///   2. BUFFERS DE CLEANUP REUTILIZÁVEIS:
-    ///      CleanupExpiredCooldowns alocava List<int>/<long> a cada chamada.
-    ///      Como roda a cada 60s e pode ter dezenas de keys, agora reutiliza
-    ///      buffers de instância (zero alocação em estado estável).
+    ///   2. INVARIANTE DOCUMENTADA EM OnStartLocalPlayer:
+    ///      A relação entre OnStartLocalPlayer, RpcInitializeLocalPlayer e
+    ///      _pendingClientInit não é óbvia. Documentado em comentário pq esse
+    ///      caminho já causou bugs no passado e o código é frágil a mudanças.
     ///
-    ///   3. CONNECTION CHECK EM TODOS OS Cmd:
-    ///      Padronizado: cada Cmd começa com check de connectionToClient.
-    ///
-    ///   4. XP FLUTUANTE SÓ APARECE SE VIVO:
-    ///      RpcOnExpGained agora filtra: se está morto, não mostra
-    ///      flutuante de XP/LevelUp na tela. Estranho ganhar XP de quest
-    ///      enquanto na tela de morte.
-    ///
-    ///   5. CANCELAMENTO DE CAST EM MORTE (mantido).
+    ///   3. RPC DE MORTE — ANIMATOR SETADO PARA TODOS OS CLIENTES:
+    ///      RpcPlayerDied seta IsDead no animator ANTES do return de
+    ///      isLocalPlayer, então outros clientes veem a animação. Documentado
+    ///      explicitamente o porquê dessa ordem, evitando que alguém "corrija"
+    ///      isso por engano no futuro.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -146,6 +146,22 @@ namespace RPG.Network
 
         private CharacterRace _cachedRace = CharacterRace.Human;
 
+        // ── Sincronização cliente: invariante de inicialização ─────────────
+        //
+        // O fluxo de inicialização do cliente tem três pontos de entrada
+        // possíveis, e a ordem depende da latência:
+        //
+        //   A) OnStartLocalPlayer roda PRIMEIRO  → _pendingClientInit fica
+        //      pronto para o RPC chegar e disparar DelayedClientInit.
+        //   B) RpcInitializeLocalPlayer roda PRIMEIRO → ele mesmo dispara
+        //      DelayedClientInit se _playerEntity já existe (vem de Awake).
+        //
+        // Para isso funcionar, _playerEntity DEVE ser cacheado em Awake
+        // (não em OnStartLocalPlayer), pois o RPC pode chegar antes do
+        // OnStartLocalPlayer ser invocado. Se alguma refatoração futura
+        // mover GetComponent<PlayerEntity> para OnStartLocalPlayer, o
+        // RPC pode chegar e ver _playerEntity == null → seta pending → mas
+        // OnStartLocalPlayer nunca roda de novo → init nunca completa.
         private bool          _clientInitialized;
         private bool          _pendingClientInit;
         private CharacterData _pendingInitData;
@@ -164,6 +180,8 @@ namespace RPG.Network
 
         private void Awake()
         {
+            // CRÍTICO: cachear AQUI, não em OnStartLocalPlayer.
+            // Ver invariante documentada nos campos _clientInitialized acima.
             _agent        = GetComponent<NavMeshAgent>();
             _animator     = GetComponentInChildren<Animator>();
             _playerEntity = GetComponent<PlayerEntity>();
@@ -214,6 +232,8 @@ namespace RPG.Network
             if (_inventory != null)
                 _inventory.OnEquipmentChanged += OnClientEquipmentChanged;
 
+            // Se o RPC chegou antes deste callback, _pendingClientInit foi setado
+            // e os dados aguardam aqui. Dispara o init agora.
             if (_pendingClientInit && _pendingInitData != null)
             {
                 var data = _pendingInitData;
@@ -844,6 +864,7 @@ namespace RPG.Network
                     : new EquipmentBonuses()
             };
 
+            // _playerEntity é cacheado em Awake (ver invariante documentada acima)
             if (_playerEntity == null)
             {
                 _pendingClientInit = true;
@@ -881,8 +902,15 @@ namespace RPG.Network
         [ClientRpc]
         private void RpcPlayerDied()
         {
+            // NOTA: animator é setado para TODOS os clientes (antes do return de
+            // isLocalPlayer). Isso é intencional — outros jogadores devem ver
+            // o estado de morte do animator. Não mover essa linha para depois
+            // do return ou só localPlayers verão a animação de morte.
             if (_animator != null) _animator.SetBool("IsDead", true);
+
             if (!isLocalPlayer) return;
+
+            // A partir daqui é só para o player local que morreu
             if (_agent != null) { _agent.ResetPath(); _agent.isStopped = true; }
             GetComponent<NetworkPlayerController>()?.SetEnabled(false);
 
@@ -896,8 +924,11 @@ namespace RPG.Network
         [ClientRpc]
         private void RpcOnRespawned(Vector3 position, float hp, float maxHp, float mp, float maxMp)
         {
+            // Animator para todos (mesma lógica de RpcPlayerDied)
             if (_animator != null) _animator.SetBool("IsDead", false);
+
             if (!isLocalPlayer) return;
+
             if (_agent != null) { _agent.isStopped = false; _agent.Warp(position); }
             GetComponent<NetworkPlayerController>()?.SetEnabled(true);
             _playerEntity?.OnServerRespawn(position, hp, maxHp, mp, maxMp);
@@ -1059,13 +1090,20 @@ namespace RPG.Network
 
         private void OnRaceStrChanged(string _, string __) => UpdateCachedRace();
 
+        // ────────────────────────────────────────────────────────────────
+        // BUG CORRIGIDO NESTA VERSÃO:
+        // A versão anterior tinha duas atribuições a maxValue. A primeira era
+        // a defesa contra o caso em que CurrentHP chega antes de MaxHP pelo
+        // mesmo batch de SyncVar; a segunda apagava essa defesa. Agora setamos
+        // exatamente uma vez, com o valor seguro.
+        // ────────────────────────────────────────────────────────────────
         private void OnNetMaxHPChanged(float _, float newMax)
         {
             if (_hpBarSlider != null)
             {
-                // Garante maxValue >= value para evitar exibição inconsistente
+                // Garante maxValue >= value para evitar slider quebrado caso
+                // CurrentHP > newMax (acontece em raros casos de ordem de hooks).
                 _hpBarSlider.maxValue = Mathf.Max(newMax, _hpBarSlider.value);
-                _hpBarSlider.maxValue = newMax;
             }
             if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
                 _playerEntity.SetHPFromServer(CurrentHP, newMax);

@@ -14,24 +14,18 @@ namespace RPG.Network
     ///
     /// Singleton DontDestroyOnLoad — sobrevive a trocas de cena.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (Lote 4 — robustez) ===
+    /// === MUDANÇAS DESTA VERSÃO (defesa contra nonce hijacking) ===
     ///
-    ///   1. RECONNECTION-AWARE NONCE STATE:
-    ///      Antes, se o cliente desconectasse durante login e reconectasse
-    ///      logo após, o _nonceReceived ficava no estado antigo brevemente.
-    ///      Agora resetamos esse estado IMEDIATAMENTE em OnDisconnect,
-    ///      antes mesmo do StopAllPendingWork.
+    ///   1. ACEITA APENAS O PRIMEIRO MsgAuthChallenge DA SESSÃO:
+    ///      O protocolo normal só envia UM challenge por conexão (no connect).
+    ///      Mas se um servidor malicioso ou um bug enviasse múltiplos
+    ///      challenges, a versão anterior aceitava o último silenciosamente,
+    ///      sobrescrevendo o nonce que o cliente já podia ter usado.
+    ///      Agora marcamos a sessão como "challenge consumed" no primeiro
+    ///      e ignoramos subsequentes com log de warning.
     ///
-    ///   2. PENDING ACTION CLEARED EM OnAuthChallenge:
-    ///      Se _pendingLoginAction era setada mas o nonce nunca chegou
-    ///      (timeout), e o cliente reconectava, a action antiga poderia
-    ///      teoricamente disparar no novo nonce. Agora limpamos explicitamente
-    ///      após executar (no fluxo normal) E em OnDisconnect.
-    ///
-    ///   3. SENDLOGIN AGORA REJEITA SE JÁ EXISTE PENDING:
-    ///      Antes, chamar SendLogin duas vezes seguidas (botão de duplo clique)
-    ///      sobrescrevia _pendingLoginAction sem invocar a primeira. Agora,
-    ///      a segunda chamada loga warning e retorna — UX consistente.
+    ///      Reset acontece em OnClientDisconnected, então uma nova conexão
+    ///      pode receber um novo challenge normalmente.
     /// </summary>
     public class ClientAuthHandler : MonoBehaviour
     {
@@ -49,6 +43,9 @@ namespace RPG.Network
         private bool      _waitingForSceneToLoad;
         private string    _sessionNonce  = "";
         private bool      _nonceReceived;
+        // Marca que já consumimos o challenge desta sessão. Resetado em disconnect.
+        // Defesa contra servidor malicioso enviando múltiplos challenges.
+        private bool      _challengeConsumed;
         private Action    _pendingLoginAction;
         private Coroutine _nonceWaitCoroutine;
 
@@ -89,8 +86,9 @@ namespace RPG.Network
 
         private void OnClientConnected()
         {
-            _nonceReceived = false;
-            _sessionNonce  = "";
+            _nonceReceived     = false;
+            _challengeConsumed = false;
+            _sessionNonce      = "";
 
             // ReplaceHandler: substitui se já existir (importante na reconexão)
             NetworkClient.ReplaceHandler<MsgAuthChallenge>          (OnAuthChallenge);
@@ -104,10 +102,9 @@ namespace RPG.Network
         private void OnClientDisconnectedEvent()
         {
             // Reset IMEDIATO do estado de nonce — antes do StopAllPendingWork.
-            // Garante que mesmo se houver código em outra parte do app verificando
-            // _nonceReceived, ele veja o estado correto.
-            _nonceReceived = false;
-            _sessionNonce  = "";
+            _nonceReceived     = false;
+            _challengeConsumed = false;
+            _sessionNonce      = "";
 
             StopAllPendingWork();
 
@@ -123,8 +120,19 @@ namespace RPG.Network
 
         private void OnAuthChallenge(MsgAuthChallenge msg)
         {
-            _sessionNonce  = msg.Nonce;
-            _nonceReceived = true;
+            // SEGURANÇA: aceita apenas o PRIMEIRO challenge da sessão.
+            // Múltiplos challenges sugerem servidor comprometido ou bug —
+            // ignoramos com warning visível para detecção.
+            if (_challengeConsumed)
+            {
+                Debug.LogWarning("[ClientAuth] SECURITY: MsgAuthChallenge adicional recebido — IGNORADO. " +
+                                 "Servidor pode estar comprometido ou houve duplicação anômala.");
+                return;
+            }
+
+            _sessionNonce      = msg.Nonce;
+            _nonceReceived     = true;
+            _challengeConsumed = true;
 
             if (_pendingLoginAction != null)
             {
